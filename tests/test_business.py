@@ -71,6 +71,17 @@ class BusinessTests(unittest.TestCase):
         self.assertIn('20', self.tg.send.call_args.args[1])
         self.assertIn('متوقف', self.tg.send.call_args.args[1])
 
+    def test_status_reports_missing_connection_then_reply_permission(self):
+        self.bot.owner_command({'chat': {'id': 10}, 'text': '/status'})
+        self.assertIn('دریافت نشده', self.tg.send.call_args.args[1])
+        self.bot.connections['A'] = dict(self.conn, rights={'can_reply': False})
+        self.bot.state.set_enabled(False)
+        self.bot.owner_command({'chat': {'id': 10}, 'text': '/status'})
+        reply = self.tg.send.call_args.args[1]
+        self.assertIn('منشی: خاموش', reply)
+        self.assertIn('اجازه پاسخ: خیر', reply)
+        self.assertNotIn('facts', reply)
+
     def test_echo_and_disabled_wrong_owner_old_messages_ignored(self):
         msg = self.msg()
         msg['via_business_bot'] = {'id': 99}

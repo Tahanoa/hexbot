@@ -121,6 +121,8 @@ class BusinessBot(Bot):
         self.state = State(secretary.database_path)
         self.connections = {}
         self.pending = {}
+        LOG.info("Secretary mode enabled; owner ID: %s; context tokens: %s; profile loaded",
+                 secretary.owner_id, config.context_length)
 
     @property
     def update_types(self):
@@ -180,6 +182,19 @@ class BusinessBot(Bot):
             ) or "هنوز گفتگویی ثبت نشده؛ از حساب دیگر به حساب شخصی متصل پیام بفرستید."
             if not self.state.enabled():
                 reply += "\nمنشی در کل خاموش است؛ برای روشن کردن: /secretary on"
+        elif command == "/status":
+            reply = (f"منشی: {'روشن' if self.state.enabled() else 'خاموش'}\n"
+                     f"شناسه مالک: {self.secretary.owner_id}\nمدل: {self.config.model}\n"
+                     f"ظرفیت توکن: {self.config.context_length}\nپروفایل منشی بارگذاری شده است.")
+            with self.lock:
+                connections = list(self.connections.values())
+            if not connections:
+                reply += "\nدر این اجرای برنامه هنوز اتصال یا پیام بیزینسی دریافت نشده است."
+            for index, conn in enumerate(connections, 1):
+                reply += (f"\nاتصال {index}: "
+                          f"مالک مطابق: {'بله' if conn.get('user', {}).get('id') == self.secretary.owner_id else 'خیر'}؛ "
+                          f"فعال: {'بله' if conn.get('is_enabled') else 'خیر'}؛ "
+                          f"اجازه پاسخ: {'بله' if conn.get('rights', {}).get('can_reply', conn.get('can_reply', False)) else 'خیر'}")
         elif command == "/clear_inbox":
             self.state.clear_inbox()
             reply = "درخواست‌های ثبت‌شده پاک شدند."
@@ -187,7 +202,7 @@ class BusinessBot(Bot):
             reply = f"شناسه شما: {self.secretary.owner_id}"
         else:
             reply = ("مدیریت منشی حساب شخصی\n/secretary on — روشن\n/secretary off — خاموش\n"
-                     "/chats — شناسه و وضعیت گفتگوها\n/inbox — ده درخواست آخر\n/clear_inbox — حذف درخواست‌ها\n"
+                     "/status — وضعیت منشی و آخرین اتصال مشاهده‌شده\n/chats — شناسه و وضعیت گفتگوها\n/inbox — ده درخواست آخر\n/clear_inbox — حذف درخواست‌ها\n"
                      "/pause CHAT_ID — توقف گفتگو\n/resume CHAT_ID — فعال‌سازی مجدد گفتگو\n"
                      "با پاسخ دستی شما، منشی همان گفتگو متوقف می‌شود.")
         self.telegram.send(chat, reply)
@@ -195,6 +210,9 @@ class BusinessBot(Bot):
     def dispatch_update(self, update, pool):
         if "business_connection" in update:
             conn = update["business_connection"]
+            LOG.info("Business connection update; enabled: %s; can reply: %s; owner matches: %s",
+                     conn.get("is_enabled", False), conn.get("rights", {}).get("can_reply", conn.get("can_reply", False)),
+                     conn.get("user", {}).get("id") == self.secretary.owner_id)
             with self.lock:
                 self.connections[conn["id"]] = conn
                 # Invalidate running jobs for a connection whose permissions changed.
@@ -212,29 +230,42 @@ class BusinessBot(Bot):
         if "message" in update:
             msg = update["message"]
             if msg.get("chat", {}).get("type") == "private" and msg.get("from", {}).get("id") == self.secretary.owner_id:
+                LOG.info("Owner control message received")
                 self.owner_command(msg)
+            else:
+                LOG.info("Direct bot message ignored: sender is not owner or chat is not private")
             return
         msg = update.get("business_message", {})
+        if msg:
+            LOG.info("Business message received; chat ID: %s", msg.get("chat", {}).get("id"))
         ident = msg.get("business_connection_id")
         if not ident or msg.get("chat", {}).get("type") != "private" or msg.get("via_bot") or msg.get("via_business_bot"):
+            if msg:
+                LOG.info("Business message ignored: missing connection, non-private chat or bot echo")
             return
         conn = self.connection(ident)
         if conn.get("user", {}).get("id") != self.secretary.owner_id:
+            LOG.info("Business message ignored: connection owner does not match OWNER_USER_ID")
             return
         key = (ident, msg["chat"]["id"])
         if msg.get("from", {}).get("id") == self.secretary.owner_id:
+            LOG.info("Owner manual reply: pausing chat ID %s", key[1])
             self.state.pause(key)
             with self.lock:
                 self.history.pop(key, None)
             return
         if msg.get("from", {}).get("is_bot") or not self.eligible(conn) or not self.state.enabled():
+            LOG.info("Business message ignored: bot sender, disabled secretary/connection or missing reply permission")
             return
         if self.config.allowed_users and msg.get("from", {}).get("id") not in self.config.allowed_users:
+            LOG.info("Business message ignored: sender not in ALLOWED_USER_IDS")
             return
         if time.time() - msg.get("date", 0) > 86400:
+            LOG.info("Business message ignored: older than 24 hours")
             return
         paused, version = self.state.snapshot(key)
         if paused:
+            LOG.info("Business message ignored: chat ID %s is paused", key[1])
             return
         if msg.get("text", "").strip().split(maxsplit=1)[:1] == ["/human"]:
             self.business_respond(msg, key, version)
