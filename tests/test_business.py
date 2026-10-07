@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -47,20 +48,18 @@ class BusinessTests(unittest.TestCase):
         self.assertEqual(self.sends()[0]['chat_id'], 20)
         self.assertIn('صاحب حساب', self.ai.chat.call_args.kwargs['system_prompt'])
 
-    def test_owner_manual_reply_pauses_and_resume_works(self):
+    def test_manual_reply_does_not_disable_other_or_same_chat(self):
         self.dispatch(self.msg(user=10))
         self.dispatch(self.msg())
-        self.ai.chat.assert_not_called()
-        self.bot.owner_command({'chat': {'id': 10}, 'text': '/resume 20'})
-        self.dispatch(self.msg())
-        self.ai.chat.assert_called_once()
+        self.dispatch(self.msg(user=30, chat=30))
+        self.assertEqual(self.ai.chat.call_count, 2)
+        self.assertEqual({m['chat_id'] for m in self.sends()}, {20, 30})
 
-    def test_chats_lists_paused_chats_without_handoff_and_after_restart(self):
+    def test_chats_lists_ids_after_restart_and_is_owner_only(self):
         self.dispatch(self.msg(user=10))
-        self.assertEqual(self.bot.state.inbox(), [])
         reopened = State(self.config.database_path)
         try:
-            self.assertEqual(reopened.chats(), [(20, 1)])
+            self.assertEqual(reopened.chats(), [(20,)])
         finally:
             reopened.db.close()
         self.bot.dispatch_update({'message': {'chat': {'id': 30, 'type': 'private'},
@@ -69,7 +68,6 @@ class BusinessTests(unittest.TestCase):
         self.bot.dispatch_update({'message': {'chat': {'id': 10, 'type': 'private'},
             'from': {'id': 10}, 'text': '/chats'}}, self.pool)
         self.assertIn('20', self.tg.send.call_args.args[1])
-        self.assertIn('متوقف', self.tg.send.call_args.args[1])
 
     def test_status_reports_missing_connection_then_reply_permission(self):
         self.bot.owner_command({'chat': {'id': 10}, 'text': '/status'})
@@ -105,13 +103,13 @@ class BusinessTests(unittest.TestCase):
         self.dispatch(self.msg())
         self.assertFalse(self.sends())
 
-    def test_manual_intervention_during_generation_discards_reply(self):
+    def test_manual_intervention_during_generation_keeps_reply(self):
         def generate(*args, **kwargs):
             self.dispatch(self.msg(user=10))
             return 'پاسخ'
         self.ai.chat.side_effect = generate
         self.dispatch(self.msg())
-        self.assertFalse(self.sends())
+        self.assertEqual(len(self.sends()), 1)
         self.assertFalse(self.bot.busy)
 
     def test_global_off_on_invalidates_running_reply(self):
@@ -123,26 +121,24 @@ class BusinessTests(unittest.TestCase):
         self.dispatch(self.msg())
         self.assertFalse(self.sends())
 
-    def test_handoff_persists_and_pauses(self):
+    def test_handoff_persists_and_keeps_reply_enabled(self):
         self.dispatch(self.msg('/human لطفاً با من تماس بگیرید'))
         self.ai.chat.assert_not_called()
         self.assertEqual(self.bot.state.inbox()[0][3], 'لطفاً با من تماس بگیرید')
-        self.assertEqual(self.bot.state.snapshot(('A', 20))[0], 1)
         second = State(self.config.database_path)
         self.assertEqual(len(second.inbox()), 1)
-        self.assertEqual(second.snapshot(('A', 20))[0], 1)
         second.db.close()
         self.dispatch(self.msg())
-        self.ai.chat.assert_not_called()
+        self.ai.chat.assert_called_once()
 
-    def test_handoff_during_generation_cancels_generated_reply(self):
+    def test_handoff_during_generation_keeps_generated_reply(self):
         def generate(*args, **kwargs):
             self.dispatch(self.msg('/human درخواست من'))
             return 'پاسخ دیرهنگام'
         self.ai.chat.side_effect = generate
         self.dispatch(self.msg())
-        self.assertEqual(len(self.sends()), 1)
-        self.assertNotIn('دیرهنگام', self.sends()[0]['text'])
+        self.assertEqual(len(self.sends()), 2)
+        self.assertIn('دیرهنگام', self.sends()[1]['text'])
 
     def test_private_controls_owner_only(self):
         for user in (20, 10):
@@ -157,13 +153,34 @@ class BusinessTests(unittest.TestCase):
         self.assertIn(('A', 20), self.bot.history)
         self.assertIn(('B', 20), self.bot.history)
 
-    def test_pause_survives_restart_before_connection_is_cached(self):
-        self.bot.owner_command({'chat': {'id': 10}, 'text': '/pause 20'})
-        second = State(self.config.database_path)
-        self.assertEqual(second.snapshot(('NEW', 20))[0], 1)
-        second.resume_chat(20)
-        self.assertEqual(second.snapshot(('NEW', 20))[0], 0)
-        second.db.close()
+    def test_legacy_pauses_removed_without_losing_global_state_or_requests(self):
+        path = Path(self.temp.name) / 'legacy.sqlite3'
+        with sqlite3.connect(path) as db:
+            db.execute('CREATE TABLE settings (key TEXT PRIMARY KEY, value INTEGER NOT NULL)')
+            db.executemany('INSERT INTO settings VALUES (?,?)', [('enabled', 1), ('pause:20', 1)])
+            db.execute('CREATE TABLE chats (connection TEXT, chat INTEGER, paused INTEGER NOT NULL, version INTEGER NOT NULL, PRIMARY KEY(connection,chat))')
+            db.execute("INSERT INTO chats VALUES ('A',20,1,3)")
+            db.execute('CREATE TABLE requests (id INTEGER PRIMARY KEY, connection TEXT, chat INTEGER, name, message, created INTEGER)')
+            db.execute("INSERT INTO requests VALUES (1,'A',20,'visitor','saved request',0)")
+        self.bot.state.db.close()
+        self.bot.state = State(path)
+        migrated = self.bot.state
+        self.assertTrue(migrated.enabled())
+        self.assertEqual(migrated.snapshot(('A', 20)), 3)
+        self.assertEqual(migrated.inbox()[0][3], 'saved request')
+        self.assertEqual(migrated.db.execute("SELECT COUNT(*) FROM settings WHERE key LIKE 'pause:%'").fetchone()[0], 0)
+        self.dispatch(self.msg())
+        self.ai.chat.assert_called_once()
+
+    def test_global_switch_controls_all_chats(self):
+        self.bot.owner_command({'chat': {'id': 10}, 'text': '/secretary off'})
+        for chat in (20, 30):
+            self.dispatch(self.msg(user=chat, chat=chat))
+        self.ai.chat.assert_not_called()
+        self.bot.owner_command({'chat': {'id': 10}, 'text': '/secretary on'})
+        for chat in (20, 30):
+            self.dispatch(self.msg(user=chat, chat=chat))
+        self.assertEqual(self.ai.chat.call_count, 2)
 
     def test_missing_profile_fails_clearly(self):
         with self.assertRaises(ValueError):

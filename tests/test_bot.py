@@ -58,10 +58,10 @@ class BotTests(unittest.TestCase):
             self.bot.respond(message(text=text))
         self.ai.chat.assert_not_called()
 
-    def test_private_chat_and_allowlist(self):
-        bot = Bot(Config("test", allowed_users=frozenset({10})), self.tg, self.ai)
+    def test_all_private_users_accepted(self):
+        bot = Bot(Config("test"), self.tg, self.ai)
         self.assertTrue(bot.accept(message()))
-        self.assertFalse(bot.accept(message(user=11)))
+        self.assertTrue(bot.accept(message(user=11)))
         msg = message()
         msg["chat"]["type"] = "group"
         self.assertFalse(bot.accept(msg))
@@ -114,7 +114,6 @@ class ConfigTests(unittest.TestCase):
             load_env(path)
             config = Config.from_env()
             self.assertEqual(config.model, "existing")
-            self.assertEqual(config.allowed_users, frozenset({1, 2}))
             self.assertEqual(config.context_length, 8192)
 
     def test_custom_context_length(self):

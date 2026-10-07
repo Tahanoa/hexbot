@@ -44,7 +44,6 @@ class Config:
     history_turns: int = 8
     max_chats: int = 100
     workers: int = 2
-    allowed_users: frozenset[int] = frozenset()
     system_prompt: str = "You are a helpful assistant. Reply in the user's language, clearly and concisely."
     telegram_proxy: str = ""
     context_length: int = 8192
@@ -71,7 +70,6 @@ class Config:
         if not model:
             raise ValueError("OLLAMA_MODEL cannot be empty")
         return cls(token=token, model=model, ollama_url=url, telegram_proxy=proxy,
-                   allowed_users=frozenset(int(x.strip()) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()),
                    system_prompt=os.getenv("SYSTEM_PROMPT", cls.system_prompt), **values)
 
 
@@ -234,8 +232,7 @@ class Bot:
 
     def accept(self, message: dict) -> bool:
         return (message.get("chat", {}).get("type") == "private"
-                and not message.get("from", {}).get("is_bot", False)
-                and (not self.config.allowed_users or message.get("from", {}).get("id") in self.config.allowed_users))
+                and not message.get("from", {}).get("is_bot", False))
 
     @property
     def update_types(self):

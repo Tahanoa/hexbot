@@ -55,7 +55,14 @@ class State:
         self.lock = threading.RLock()
         with self.db:
             self.db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value INTEGER NOT NULL)")
-            self.db.execute("CREATE TABLE IF NOT EXISTS chats (connection TEXT, chat INTEGER, paused INTEGER NOT NULL, version INTEGER NOT NULL, PRIMARY KEY(connection, chat))")
+            self.db.execute("CREATE TABLE IF NOT EXISTS chats (connection TEXT, chat INTEGER, version INTEGER NOT NULL, PRIMARY KEY(connection, chat))")
+            # Migrate old per-chat pauses without losing requests or the global switch.
+            if any(row[1] == "paused" for row in self.db.execute("PRAGMA table_info(chats)")):
+                self.db.execute("CREATE TABLE chats_new (connection TEXT, chat INTEGER, version INTEGER NOT NULL, PRIMARY KEY(connection, chat))")
+                self.db.execute("INSERT INTO chats_new SELECT connection, chat, version FROM chats")
+                self.db.execute("DROP TABLE chats")
+                self.db.execute("ALTER TABLE chats_new RENAME TO chats")
+            self.db.execute("DELETE FROM settings WHERE key LIKE 'pause:%'")
             self.db.execute("CREATE TABLE IF NOT EXISTS requests (id INTEGER PRIMARY KEY, connection TEXT, chat INTEGER, name TEXT, message TEXT, created INTEGER)")
 
     def enabled(self):
@@ -71,31 +78,19 @@ class State:
 
     def snapshot(self, key):
         with self.lock, self.db:
-            default = self.db.execute("SELECT value FROM settings WHERE key=?", (f"pause:{key[1]}",)).fetchone()
-            self.db.execute("INSERT OR IGNORE INTO chats VALUES (?, ?, ?, 0)", (*key, int(bool(default and default[0]))))
-            return self.db.execute("SELECT paused, version FROM chats WHERE connection=? AND chat=?", key).fetchone()
+            self.db.execute("INSERT OR IGNORE INTO chats VALUES (?, ?, 0)", key)
+            return self.db.execute("SELECT version FROM chats WHERE connection=? AND chat=?", key).fetchone()[0]
 
-    def pause(self, key, paused=True):
+    def invalidate(self, key):
         with self.lock, self.db:
             self.snapshot(key)
-            self.db.execute("UPDATE chats SET paused=?, version=version+1 WHERE connection=? AND chat=?", (int(paused), *key))
-
-    def pause_chat(self, chat):
-        with self.lock, self.db:
-            self.db.execute("INSERT OR REPLACE INTO settings VALUES (?, 1)", (f"pause:{chat}",))
-            self.db.execute("UPDATE chats SET paused=1, version=version+1 WHERE chat=?", (chat,))
-
-    def resume_chat(self, chat):
-        with self.lock, self.db:
-            self.db.execute("DELETE FROM settings WHERE key=?", (f"pause:{chat}",))
-            self.db.execute("UPDATE chats SET paused=0, version=version+1 WHERE chat=?", (chat,))
+            self.db.execute("UPDATE chats SET version=version+1 WHERE connection=? AND chat=?", key)
 
     def request(self, key, name, text, version):
         with self.lock, self.db:
-            if not self.enabled() or self.snapshot(key) != (0, version):
+            if not self.enabled() or self.snapshot(key) != version:
                 return False
             self.db.execute("INSERT INTO requests(connection,chat,name,message,created) VALUES (?,?,?,?,?)", (*key, name[:200], text[:8000], int(time.time())))
-            self.pause(key)
             return True
 
     def inbox(self):
@@ -105,7 +100,7 @@ class State:
     def chats(self):
         with self.lock:
             return self.db.execute(
-                "SELECT chat, MAX(paused) FROM chats GROUP BY chat ORDER BY MAX(rowid) DESC LIMIT 20"
+                "SELECT chat FROM chats GROUP BY chat ORDER BY MAX(rowid) DESC LIMIT 20"
             ).fetchall()
 
     def clear_inbox(self):
@@ -142,8 +137,8 @@ class BusinessBot(Bot):
     def live(self, key, version):
         with self.lock:
             conn = self.connections.get(key[0], {})
-        paused, current = self.state.snapshot(key)
-        return self.eligible(conn) and self.state.enabled() and not paused and current == version
+        current = self.state.snapshot(key)
+        return self.eligible(conn) and self.state.enabled() and current == version
 
     def send_business(self, key, text, version):
         for start in range(0, len(text), 2000):
@@ -161,24 +156,14 @@ class BusinessBot(Bot):
         if command == "/secretary" and arg in ("on", "off"):
             self.state.set_enabled(arg == "on")
             reply = "منشی روشن شد." if arg == "on" else "منشی خاموش شد."
-        elif command == "/pause" and arg.isdigit():
-            self.state.pause_chat(int(arg))
-            reply = "پاسخ خودکار این گفتگو متوقف شد."
-        elif command == "/resume" and arg.isdigit():
-            self.state.resume_chat(int(arg))
-            with self.lock:
-                for key in list(self.history):
-                    if isinstance(key, tuple) and key[1] == int(arg):
-                        self.history.pop(key)
-            reply = "پاسخ خودکار این گفتگو فعال شد."
         elif command == "/inbox":
             rows = self.state.inbox()
             reply = "\n\n".join(f"#{r[0]} | شناسه گفتگو: {r[1]} | {r[2]}\n{r[3]}" for r in rows) or "درخواستی ثبت نشده است."
         elif command == "/chats":
             rows = self.state.chats()
             reply = "\n".join(
-                f"شناسه گفتگو: {chat} | {'متوقف' if paused else 'توقف ندارد'}"
-                for chat, paused in rows
+                f"شناسه گفتگو: {chat}"
+                for (chat,) in rows
             ) or "هنوز گفتگویی ثبت نشده؛ از حساب دیگر به حساب شخصی متصل پیام بفرستید."
             if not self.state.enabled():
                 reply += "\nمنشی در کل خاموش است؛ برای روشن کردن: /secretary on"
@@ -202,9 +187,8 @@ class BusinessBot(Bot):
             reply = f"شناسه شما: {self.secretary.owner_id}"
         else:
             reply = ("مدیریت منشی حساب شخصی\n/secretary on — روشن\n/secretary off — خاموش\n"
-                     "/status — وضعیت منشی و آخرین اتصال مشاهده‌شده\n/chats — شناسه و وضعیت گفتگوها\n/inbox — ده درخواست آخر\n/clear_inbox — حذف درخواست‌ها\n"
-                     "/pause CHAT_ID — توقف گفتگو\n/resume CHAT_ID — فعال‌سازی مجدد گفتگو\n"
-                     "با پاسخ دستی شما، منشی همان گفتگو متوقف می‌شود.")
+                     "/status — وضعیت منشی و آخرین اتصال مشاهده‌شده\n/chats — شناسه گفتگوها\n/inbox — ده درخواست آخر\n/clear_inbox — حذف درخواست‌ها\n"
+                     "پاسخ‌گویی فقط برای همه گفتگوها با هم روشن یا خاموش می‌شود.")
         self.telegram.send(chat, reply)
 
     def dispatch_update(self, update, pool):
@@ -218,12 +202,12 @@ class BusinessBot(Bot):
                 # Invalidate running jobs for a connection whose permissions changed.
                 keys = [k for k in self.busy if k[0] == conn["id"]]
             for key in keys:
-                self.state.pause(key)
+                self.state.invalidate(key)
             return
         if "deleted_business_messages" in update:
             msg = update["deleted_business_messages"]
             key = (msg["business_connection_id"], msg["chat"]["id"])
-            self.state.pause(key)
+            self.state.invalidate(key)
             with self.lock:
                 self.history.pop(key, None)
             return
@@ -249,24 +233,16 @@ class BusinessBot(Bot):
             return
         key = (ident, msg["chat"]["id"])
         if msg.get("from", {}).get("id") == self.secretary.owner_id:
-            LOG.info("Owner manual reply: pausing chat ID %s", key[1])
-            self.state.pause(key)
-            with self.lock:
-                self.history.pop(key, None)
+            LOG.info("Owner outgoing message skipped; automatic replies remain enabled")
+            self.state.snapshot(key)
             return
         if msg.get("from", {}).get("is_bot") or not self.eligible(conn) or not self.state.enabled():
             LOG.info("Business message ignored: bot sender, disabled secretary/connection or missing reply permission")
             return
-        if self.config.allowed_users and msg.get("from", {}).get("id") not in self.config.allowed_users:
-            LOG.info("Business message ignored: sender not in ALLOWED_USER_IDS")
-            return
         if time.time() - msg.get("date", 0) > 86400:
             LOG.info("Business message ignored: older than 24 hours")
             return
-        paused, version = self.state.snapshot(key)
-        if paused:
-            LOG.info("Business message ignored: chat ID %s is paused", key[1])
-            return
+        version = self.state.snapshot(key)
         if msg.get("text", "").strip().split(maxsplit=1)[:1] == ["/human"]:
             self.business_respond(msg, key, version)
             return
@@ -321,9 +297,7 @@ class BusinessBot(Bot):
                 return
             if not self.state.request(key, message.get("from", {}).get("first_name", ""), note, version):
                 return
-            # Receipt is the sole response after pausing for this explicit handoff.
-            self.telegram.call("sendMessage", {"business_connection_id": key[0], "chat_id": key[1],
-                "text": "پیامت برای بررسی صاحب حساب ثبت شد. پاسخ خودکار این گفتگو متوقف شد؛ زمان پاسخ ایشان مشخص نیست."})
+            self.send_business(key, "پیامت برای بررسی صاحب حساب ثبت شد؛ زمان پاسخ ایشان مشخص نیست. پاسخ‌گویی خودکار همچنان فعال است.", version)
             return
         with self.lock:
             messages = list(self.history.get(key, []))
