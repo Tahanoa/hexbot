@@ -102,7 +102,8 @@ class BotTests(unittest.TestCase):
 
 class ConfigTests(unittest.TestCase):
     def test_missing_token_and_invalid_limits(self):
-        for env in ({}, {"TELEGRAM_BOT_TOKEN": "test", "HISTORY_TURNS": "0"}):
+        for env in ({}, {"TELEGRAM_BOT_TOKEN": "test", "HISTORY_TURNS": "0"},
+                    {"TELEGRAM_BOT_TOKEN": "test", "OLLAMA_NUM_CTX": "0"}):
             with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
                 Config.from_env()
 
@@ -114,6 +115,11 @@ class ConfigTests(unittest.TestCase):
             config = Config.from_env()
             self.assertEqual(config.model, "existing")
             self.assertEqual(config.allowed_users, frozenset({1, 2}))
+            self.assertEqual(config.context_length, 8192)
+
+    def test_custom_context_length(self):
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "test", "OLLAMA_NUM_CTX": "16384"}, clear=True):
+            self.assertEqual(Config.from_env().context_length, 16384)
 
 
 class NetworkTests(unittest.TestCase):
@@ -164,11 +170,12 @@ class HttpTests(unittest.TestCase):
         thread.start()
         try:
             url = f"http://127.0.0.1:{server.server_port}"
-            ai = Ollama(Config("secret", ollama_url=url))
+            ai = Ollama(Config("secret", ollama_url=url, context_length=16384))
             self.assertEqual(ai.chat([{"role": "user", "content": "سلام"}]), "پاسخ محلی")
             path, payload = captured[0]
             self.assertEqual(path, "/api/chat")
             self.assertFalse(payload["stream"])
+            self.assertEqual(payload["options"]["num_ctx"], 16384)
             self.assertEqual(payload["model"], "qwen2.5:3b")
             self.assertEqual(payload["messages"][0]["role"], "system")
             self.assertEqual(payload["messages"][1]["content"], "سلام")

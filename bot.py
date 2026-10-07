@@ -47,6 +47,7 @@ class Config:
     allowed_users: frozenset[int] = frozenset()
     system_prompt: str = "You are a helpful assistant. Reply in the user's language, clearly and concisely."
     telegram_proxy: str = ""
+    context_length: int = 8192
 
     @classmethod
     def from_env(cls) -> Config:
@@ -62,7 +63,8 @@ class Config:
             raise ValueError("TELEGRAM_PROXY_URL must be an HTTP(S) proxy")
         values = {name: int(os.getenv(env, str(default))) for name, env, default in (
             ("timeout", "OLLAMA_TIMEOUT", 180), ("history_turns", "HISTORY_TURNS", 8),
-            ("max_chats", "MAX_CHATS", 100), ("workers", "MAX_CONCURRENT_CHATS", 2))}
+            ("max_chats", "MAX_CHATS", 100), ("workers", "MAX_CONCURRENT_CHATS", 2),
+            ("context_length", "OLLAMA_NUM_CTX", 8192))}
         if any(value <= 0 for value in values.values()):
             raise ValueError("Numeric settings must be positive")
         model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b").strip()
@@ -153,7 +155,8 @@ class Ollama:
     def chat(self, messages: list[dict], system_prompt: str | None = None) -> str:
         data = self.client.post("/api/chat", {"model": self.config.model,
             "messages": [{"role": "system", "content": self.config.system_prompt if system_prompt is None else system_prompt}] + messages,
-            "stream": False, "options": {"num_predict": 2048}}, self.config.timeout)
+            "stream": False, "options": {"num_predict": 2048,
+                "num_ctx": self.config.context_length}}, self.config.timeout)
         answer = data.get("message", {}).get("content", "")
         if data.get("error") or not isinstance(answer, str) or not answer.strip():
             raise ApiError("Ollama")
