@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import signal
+import socket
+import ssl
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -72,16 +74,39 @@ class Config:
 
 
 class ApiError(Exception):
-    def __init__(self, service: str, status: int = 0, retry_after: int = 0):
+    def __init__(self, service: str, status: int = 0, retry_after: int = 0, reason: str = ""):
         self.service, self.status, self.retry_after = service, status, retry_after
-        super().__init__(f"{service} request failed (status {status})")
+        self.reason = reason
+        detail = f"; {reason}" if reason else ""
+        super().__init__(f"{service} request failed (status {status}{detail})")
+
+
+def network_reason(exc) -> str:
+    """Return fixed diagnostic labels without URLs, tokens or proxy credentials."""
+    cause = exc.reason if isinstance(exc, URLError) else exc
+    if isinstance(cause, ssl.SSLCertVerificationError):
+        return "TLS certificate verification failed"
+    if isinstance(cause, ssl.SSLError):
+        return "TLS connection failed"
+    if isinstance(cause, socket.gaierror):
+        return "DNS resolution failed"
+    if isinstance(cause, TimeoutError) or getattr(cause, "winerror", None) == 10060:
+        return "Connection timed out"
+    if isinstance(cause, ConnectionRefusedError) or getattr(cause, "winerror", None) == 10061:
+        return "Connection refused; check VPN/proxy address and port"
+    if isinstance(cause, ConnectionResetError):
+        return "Connection reset by peer"
+    if isinstance(cause, ValueError):
+        return "Invalid server response or proxy configuration"
+    return "Network connection failed; check API connectivity and VPN/proxy routing"
 
 
 class JsonClient:
     def __init__(self, base_url: str, service: str, proxy: str | None = None):
         self.base_url, self.service = base_url, service
-        # Explicitly bypass environment proxies for local model requests.
-        self.opener = build_opener(ProxyHandler({"http": proxy, "https": proxy} if proxy else {}))
+        # None: use OS/environment proxy settings. Empty string: force direct.
+        proxies = None if proxy is None else ({"http": proxy, "https": proxy} if proxy else {})
+        self.opener = build_opener(ProxyHandler(proxies))
 
     def post(self, path: str, payload: dict, timeout: int = 30) -> dict:
         request = Request(self.base_url + path, data=json.dumps(payload).encode("utf-8"),
@@ -96,9 +121,9 @@ class JsonClient:
             except (ValueError, TypeError, AttributeError):
                 pass
             raise ApiError(self.service, exc.code, retry_after) from None
-        except (URLError, TimeoutError, OSError, ValueError):
+        except (URLError, TimeoutError, OSError, ValueError) as exc:
             # Never log raw URLs/errors: Telegram URLs contain the bot token.
-            raise ApiError(self.service) from None
+            raise ApiError(self.service, reason=network_reason(exc)) from None
         if not isinstance(data, dict):
             raise ApiError(self.service)
         return data
@@ -106,7 +131,7 @@ class JsonClient:
 
 class Telegram:
     def __init__(self, config: Config):
-        self.client = JsonClient(f"https://api.telegram.org/bot{config.token}/", "Telegram", config.telegram_proxy)
+        self.client = JsonClient(f"https://api.telegram.org/bot{config.token}/", "Telegram", config.telegram_proxy or None)
 
     def call(self, method: str, payload: dict, timeout: int = 30):
         data = self.client.post(method, payload, timeout)
@@ -123,7 +148,7 @@ class Telegram:
 class Ollama:
     def __init__(self, config: Config):
         self.config = config
-        self.client = JsonClient(config.ollama_url, "Ollama")
+        self.client = JsonClient(config.ollama_url, "Ollama", proxy="")
 
     def chat(self, messages: list[dict], system_prompt: str | None = None) -> str:
         data = self.client.post("/api/chat", {"model": self.config.model,

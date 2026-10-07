@@ -1,5 +1,8 @@
 import json
 import os
+import socket
+import ssl
+from urllib.error import URLError
 import tempfile
 import threading
 import unittest
@@ -111,6 +114,37 @@ class ConfigTests(unittest.TestCase):
             config = Config.from_env()
             self.assertEqual(config.model, "existing")
             self.assertEqual(config.allowed_users, frozenset({1, 2}))
+
+
+class NetworkTests(unittest.TestCase):
+    def test_telegram_uses_system_proxy_and_ollama_bypasses_it(self):
+        with patch('bot.ProxyHandler') as handler, patch('bot.build_opener'):
+            Telegram(Config('secret'))
+            handler.assert_called_with(None)
+            Ollama(Config('secret'))
+            handler.assert_called_with({})
+            Telegram(Config('secret', telegram_proxy='http://localhost:8080'))
+            handler.assert_called_with({'http': 'http://localhost:8080', 'https': 'http://localhost:8080'})
+
+    def test_safe_error_categories_without_sensitive_details(self):
+        cases = [
+            (socket.gaierror('https://example.com/botSECRET'), 'DNS resolution failed'),
+            (TimeoutError('https://example.com/botSECRET'), 'Connection timed out'),
+            (ConnectionRefusedError('password SECRET'), 'Connection refused'),
+            (ssl.SSLCertVerificationError('token SECRET'), 'TLS certificate verification failed'),
+            (ConnectionResetError('SECRET'), 'Connection reset'),
+            (ValueError('SECRET'), 'Invalid server response'),
+        ]
+        for cause, label in cases:
+            for exc in (cause, URLError(cause)):
+                client = JsonClient('https://example.com/botSECRET/', 'Telegram', proxy='')
+                client.opener = Mock()
+                client.opener.open.side_effect = exc
+                with self.assertRaises(ApiError) as ctx:
+                    client.post('getMe', {})
+                self.assertIn(label, str(ctx.exception))
+                self.assertNotIn('SECRET', str(ctx.exception))
+                self.assertNotIn('https://', str(ctx.exception))
 
 
 class HttpTests(unittest.TestCase):
