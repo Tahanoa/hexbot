@@ -55,6 +55,22 @@ class BusinessTests(unittest.TestCase):
         self.dispatch(self.msg())
         self.ai.chat.assert_called_once()
 
+    def test_chats_lists_paused_chats_without_handoff_and_after_restart(self):
+        self.dispatch(self.msg(user=10))
+        self.assertEqual(self.bot.state.inbox(), [])
+        reopened = State(self.config.database_path)
+        try:
+            self.assertEqual(reopened.chats(), [(20, 1)])
+        finally:
+            reopened.db.close()
+        self.bot.dispatch_update({'message': {'chat': {'id': 30, 'type': 'private'},
+            'from': {'id': 30}, 'text': '/chats'}}, self.pool)
+        self.tg.send.assert_not_called()
+        self.bot.dispatch_update({'message': {'chat': {'id': 10, 'type': 'private'},
+            'from': {'id': 10}, 'text': '/chats'}}, self.pool)
+        self.assertIn('20', self.tg.send.call_args.args[1])
+        self.assertIn('متوقف', self.tg.send.call_args.args[1])
+
     def test_echo_and_disabled_wrong_owner_old_messages_ignored(self):
         msg = self.msg()
         msg['via_business_bot'] = {'id': 99}

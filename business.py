@@ -102,6 +102,12 @@ class State:
         with self.lock:
             return self.db.execute("SELECT id, chat, name, message FROM requests ORDER BY id DESC LIMIT 10").fetchall()
 
+    def chats(self):
+        with self.lock:
+            return self.db.execute(
+                "SELECT chat, MAX(paused) FROM chats GROUP BY chat ORDER BY MAX(rowid) DESC LIMIT 20"
+            ).fetchall()
+
     def clear_inbox(self):
         with self.lock, self.db:
             self.db.execute("DELETE FROM requests")
@@ -166,6 +172,14 @@ class BusinessBot(Bot):
         elif command == "/inbox":
             rows = self.state.inbox()
             reply = "\n\n".join(f"#{r[0]} | شناسه گفتگو: {r[1]} | {r[2]}\n{r[3]}" for r in rows) or "درخواستی ثبت نشده است."
+        elif command == "/chats":
+            rows = self.state.chats()
+            reply = "\n".join(
+                f"شناسه گفتگو: {chat} | {'متوقف' if paused else 'توقف ندارد'}"
+                for chat, paused in rows
+            ) or "هنوز گفتگویی ثبت نشده؛ از حساب دیگر به حساب شخصی متصل پیام بفرستید."
+            if not self.state.enabled():
+                reply += "\nمنشی در کل خاموش است؛ برای روشن کردن: /secretary on"
         elif command == "/clear_inbox":
             self.state.clear_inbox()
             reply = "درخواست‌های ثبت‌شده پاک شدند."
@@ -173,7 +187,7 @@ class BusinessBot(Bot):
             reply = f"شناسه شما: {self.secretary.owner_id}"
         else:
             reply = ("مدیریت منشی حساب شخصی\n/secretary on — روشن\n/secretary off — خاموش\n"
-                     "/inbox — ده درخواست آخر\n/clear_inbox — حذف درخواست‌ها\n"
+                     "/chats — شناسه و وضعیت گفتگوها\n/inbox — ده درخواست آخر\n/clear_inbox — حذف درخواست‌ها\n"
                      "/pause CHAT_ID — توقف گفتگو\n/resume CHAT_ID — فعال‌سازی مجدد گفتگو\n"
                      "با پاسخ دستی شما، منشی همان گفتگو متوقف می‌شود.")
         self.telegram.send(chat, reply)
