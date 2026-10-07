@@ -125,9 +125,9 @@ class Ollama:
         self.config = config
         self.client = JsonClient(config.ollama_url, "Ollama")
 
-    def chat(self, messages: list[dict]) -> str:
+    def chat(self, messages: list[dict], system_prompt: str | None = None) -> str:
         data = self.client.post("/api/chat", {"model": self.config.model,
-            "messages": [{"role": "system", "content": self.config.system_prompt}] + messages,
+            "messages": [{"role": "system", "content": self.config.system_prompt if system_prompt is None else system_prompt}] + messages,
             "stream": False, "options": {"num_predict": 2048}}, self.config.timeout)
         answer = data.get("message", {}).get("content", "")
         if data.get("error") or not isinstance(answer, str) or not answer.strip():
@@ -151,6 +151,9 @@ class Bot:
         command = text.split(maxsplit=1)[0].split("@")[0].lower() if text else ""
         if command in ("/start", "/help"):
             self.telegram.send(chat_id, "سلام! پیام متنی بفرست تا با هوش مصنوعی محلی پاسخ بدهم.\n/reset — پاک‌کردن حافظهٔ گفتگو\n/model — نمایش مدل")
+            return
+        if command == "/whoami":
+            self.telegram.send(chat_id, f"شناسه شما: {message.get('from', {}).get('id')}")
             return
         if command == "/reset":
             with self.lock:
@@ -206,6 +209,24 @@ class Bot:
                 and not message.get("from", {}).get("is_bot", False)
                 and (not self.config.allowed_users or message.get("from", {}).get("id") in self.config.allowed_users))
 
+    @property
+    def update_types(self):
+        return ["message"]
+
+    def dispatch_update(self, update: dict, pool):
+        message = update.get("message", {})
+        if not self.accept(message):
+            return
+        chat_id = message["chat"]["id"]
+        with self.lock:
+            occupied = chat_id in self.busy or len(self.busy) >= self.config.workers
+            if not occupied:
+                self.busy.add(chat_id)
+        if occupied:
+            self.telegram.send(chat_id, "در حال پاسخ‌دادن هستم؛ لطفاً کمی بعد دوباره پیام بده.")
+        else:
+            pool.submit(self.work, message)
+
     def run(self):
         me = self.telegram.call("getMe", {})
         info = self.telegram.call("getWebhookInfo", {})
@@ -217,21 +238,11 @@ class Bot:
             while not self.stop.is_set():
                 try:
                     updates = self.telegram.call("getUpdates", {"offset": offset, "timeout": 25,
-                        "allowed_updates": ["message"]}, timeout=35)
+                        "allowed_updates": self.update_types}, timeout=35)
                     for update in updates:
                         if self.stop.is_set():
                             break
-                        message = update.get("message", {})
-                        if self.accept(message):
-                            chat_id = message["chat"]["id"]
-                            with self.lock:
-                                occupied = chat_id in self.busy or len(self.busy) >= self.config.workers
-                                if not occupied:
-                                    self.busy.add(chat_id)
-                            if occupied:
-                                self.telegram.send(chat_id, "در حال پاسخ‌دادن هستم؛ لطفاً کمی بعد دوباره پیام بده.")
-                            else:
-                                pool.submit(self.work, message)
+                        self.dispatch_update(update, pool)
                         offset = update["update_id"] + 1
                 except ApiError as exc:
                     LOG.warning("%s", exc)
@@ -244,7 +255,12 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         load_env(Path(__file__).resolve().with_name(".env"))
-        bot = Bot(Config.from_env())
+        config = Config.from_env()
+        if os.getenv("BUSINESS_MODE", "false").lower() == "true":
+            from business import BusinessBot, SecretaryConfig
+            bot = BusinessBot(config, SecretaryConfig.from_env())
+        else:
+            bot = Bot(config)
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda *_: bot.stop.set())
         bot.run()
