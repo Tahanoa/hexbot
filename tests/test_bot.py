@@ -2,6 +2,8 @@ import json
 import os
 import socket
 import ssl
+import subprocess
+import sys
 from urllib.error import URLError
 import tempfile
 import threading
@@ -122,6 +124,28 @@ class ConfigTests(unittest.TestCase):
 
 
 class NetworkTests(unittest.TestCase):
+    def test_secretary_script_startup_network_error_is_caught(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / 'profile.json'
+            profile.write_text(json.dumps({'owner_name': 'owner'}))
+            env = dict(os.environ, TELEGRAM_BOT_TOKEN='test', BUSINESS_MODE='true',
+                OWNER_USER_ID='10', SECRETARY_PROFILE=str(profile),
+                SECRETARY_DATABASE=str(Path(directory) / 'state.sqlite3'))
+            script = """import runpy
+from unittest.mock import Mock, patch
+from urllib.error import URLError
+opener = Mock()
+opener.open.side_effect = URLError(ConnectionRefusedError('refused'))
+with patch('urllib.request.build_opener', return_value=opener):
+    runpy.run_path('bot.py', run_name='__main__')
+"""
+            result = subprocess.run([sys.executable, '-c', script], env=env,
+                cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('ERROR Telegram request failed', result.stderr)
+            self.assertIn('Connection refused', result.stderr)
+            self.assertNotIn('Traceback', result.stderr)
+
     def test_telegram_uses_system_proxy_and_ollama_bypasses_it(self):
         with patch('bot.ProxyHandler') as handler, patch('bot.build_opener'):
             Telegram(Config('secret'))

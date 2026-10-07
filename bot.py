@@ -7,6 +7,7 @@ import os
 import signal
 import socket
 import ssl
+import sys
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -296,4 +297,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # business imports bot; reuse this module so ApiError has one identity.
+    sys.modules["bot"] = sys.modules[__name__]
     raise SystemExit(main())
