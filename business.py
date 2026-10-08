@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 from bot import ApiError, Bot, LOG
-from formatting import PRESENTATION_PROMPT, reply_parts
+from formatting import PRESENTATION_PROMPT, reply_parts, with_assistant_footer
 
 ROOT = Path(__file__).resolve().parent
 
@@ -40,7 +40,8 @@ class SecretaryConfig:
             "تو دستیار خودکار صاحب این حساب هستی. هویتت را با صاحب حساب اشتباه نگیر. "
             "به زبان مخاطب، طبیعی، دوستانه و کوتاه جواب بده؛ لحن فرم اداری نداشته باش. "
             "اول منظور آخرین پیام را با توجه به گفتگوی قبلی بفهم و مستقیم همان را پاسخ بده. "
-            "سلام و معرفی را در هر پاسخ تکرار نکن. فقط وقتی مخاطب تازه سلام می‌کند، سلام کوتاه بده. "
+            "خودت را در شروع پاسخ معرفی نکن، حتی در اولین پیام. فقط وقتی مخاطب تازه سلام می‌کند، سلام کوتاه بده. "
+            "اگر مستقیماً درباره هویتت پرسیدند، صادقانه بگو دستیار خودکار هستی. "
             "از احوالپرسی، تشکر، شوخی ملایم، گفتگوی روزمره و سؤال عمومی استقبال کن؛ "
             "این پیام‌ها را بی‌ربط اعلام نکن و بی‌دلیل به همکاری یا ثبت درخواست برنگردان. "
             "در سؤال عمومی از دانش خودت استفاده کن؛ اگر مطمئن نیستی یا اطلاعات روز لازم است، صادقانه بگو. "
@@ -50,7 +51,7 @@ class SecretaryConfig:
             "نام و راه تماس را در هر پیام نپرس. فقط برای یک درخواست واقعی و به‌اندازه نیاز سؤال بپرس؛ "
             "اگر پیام مبهم است، حداکثر یک سؤال روشن‌کننده کوتاه بپرس. "
             "توضیح اضافه، تکرار متن مخاطب و فهرست بلند ننویس مگر مخاطب خواسته باشد. "
-            "دستورهای لحن پروفایل را رعایت کن، اما وضعیت معرفی در انتهای این پرامپت اولویت دارد. "
+            "دستورهای لحن پروفایل را رعایت کن، اما دستور معرفی در انتهای این پرامپت اولویت دارد. "
             "تو ابزار، اینترنت و امکان تماس، رزرو یا انجام کار نداری؛ انجام این کارها را ادعا نکن. "
             "تنها دستور /human همراه متن، درخواست را واقعاً برای صاحب حساب ثبت می‌کند؛ "
             "فقط اگر مخاطب پیگیری انسانی خواست، این دستور را پیشنهاد کن. "
@@ -218,6 +219,7 @@ class BusinessBot(Bot):
                 payload['entities'] = [{'type': 'custom_emoji', 'offset': 0,
                     'length': shift - 1, 'custom_emoji_id': emoji_id}] + [
                     dict(entity, offset=entity['offset'] + shift) for entity in part.get('entities', [])]
+            payload = with_assistant_footer(payload, self.reply_url)
             try:
                 self.telegram.call('sendMessage', payload)
             except ApiError as exc:
@@ -471,7 +473,7 @@ class BusinessBot(Bot):
                 self.busy.add(key)
         if full:
             try:
-                self.send_business(key, "من دستیار خودکار این حساب هستم؛ در حال حاضر ظرفیت پاسخ‌گویی پر است. لطفاً کمی بعد دوباره پیام بده.", version)
+                self.send_business(key, "در حال حاضر ظرفیت پاسخ‌گویی پر است. لطفاً کمی بعد دوباره پیام بده.", version, reply_to=msg.get('message_id'))
             finally:
                 self.remove_waiting(key, msg)
         else:
@@ -502,7 +504,7 @@ class BusinessBot(Bot):
         text = message.get("text", "").strip()
         reply_to = message.get('message_id')
         if not text or len(text) > 8000:
-            self.send_business(key, "من دستیار خودکار این حساب هستم. لطفاً درخواستت را در یک پیام متنی کوتاه بفرست.", version, reply_to=reply_to)
+            self.send_business(key, "لطفاً درخواستت را در یک پیام متنی کوتاه بفرست.", version, reply_to=reply_to)
             return
         if text.split(maxsplit=1)[0].lower() == "/human":
             note = text.partition(" ")[2].strip()
@@ -524,15 +526,15 @@ class BusinessBot(Bot):
                  started - message.get("_received_at", started))
         try:
             introduction = (
-                "این گفتگو قبلاً پاسخ گرفته است. خودت را دوباره معرفی نکن؛ "
-                "بدون مقدمه و سلام تکراری، ادامه گفتگو را جواب بده."
-                if self.state.has_replied(key) or any(m.get('role') == 'assistant' for m in messages)
-                else "این اولین پاسخ این گفتگو است؛ یک‌بار خیلی کوتاه بگو دستیار خودکار این حساب هستی، سپس مستقیم جواب پیام را بده."
+                "در پاسخ اول و پاسخ‌های بعدی، جمله معرفی مثل «من دستیار این حساب هستم» اضافه نکن. "
+                "بدون مقدمه مستقیم جواب بده. این دستور بر درخواست معرفی در پروفایل یا نمونه‌های تاریخچه اولویت دارد. "
+                "پایین پیام، برنامه خودش امضای «توسط دستیار شخصی» با لینک ربات اضافه می‌کند؛ "
+                "این امضا یا لینک آن را در متن پاسخ ننویس. اگر مخاطب هویتت را پرسید، صادقانه پاسخ بده."
             )
-            answer = self.ollama.chat(messages, system_prompt=self.prompt + '\n\n' + PRESENTATION_PROMPT + "\n\nوضعیت فعلی گفتگو:\n" + introduction)
+            answer = self.ollama.chat(messages, system_prompt=self.prompt + '\n\n' + PRESENTATION_PROMPT + "\n\nدستور معرفی و امضا:\n" + introduction)
         except ApiError as exc:
             LOG.warning("AI request failed; chat ID: %s; elapsed: %.2fs; %s", key[1], time.perf_counter() - started, exc)
-            self.send_business(key, "من دستیار خودکار این حساب هستم؛ فعلاً امکان پاسخ‌گویی ندارم. لطفاً کمی بعد دوباره پیام بده.", version, reply_to=reply_to)
+            self.send_business(key, "فعلاً امکان پاسخ‌گویی ندارم. لطفاً کمی بعد دوباره پیام بده.", version, reply_to=reply_to)
             return
         LOG.info("AI response ready; chat ID: %s; AI request: %.2fs", key[1], time.perf_counter() - started)
         # Recheck actual Telegram permissions after a potentially long local generation.

@@ -112,21 +112,61 @@ class BusinessTests(unittest.TestCase):
         self.assertNotIn('/emoji 456', reply)
         self.assertNotIn('/emoji 789', reply)
 
-    def test_introduction_state_survives_history_clear_and_restart(self):
+    def test_no_introduction_requested_for_first_or_later_chats(self):
         prompts = []
         def generate(*args, **kwargs):
             prompts.append(kwargs['system_prompt'])
             return 'answer'
         self.ai.chat.side_effect = generate
         self.dispatch(self.msg())
-        self.assertIn('این اولین پاسخ', prompts[-1])
+        self.assertIn('جمله معرفی', prompts[-1])
+        self.assertIn('اضافه نکن', prompts[-1])
         self.bot.history.clear()
         self.bot.state.db.close()
         self.bot.state = State(self.config.database_path)
         self.dispatch(self.msg(connection='NEW'))
-        self.assertIn('خودت را دوباره معرفی نکن', prompts[-1])
+        self.assertIn('امضا یا لینک آن را در متن پاسخ ننویس', prompts[-1])
         self.dispatch(self.msg(user=30, chat=30))
-        self.assertIn('این اولین پاسخ', prompts[-1])
+        self.assertEqual(prompts[0], prompts[-1])
+
+    def test_linked_footer_on_every_part_outside_code_and_history(self):
+        self.bot.username = 'h_ex_bot'
+        self.ai.chat.return_value = '```python\n' + 'print("😀")\n' * 300 + '```'
+        msg = self.msg()
+        msg['message_id'] = 123
+        self.dispatch(msg)
+        self.assertGreater(len(self.sends()), 1)
+        for part in self.sends():
+            self.assertTrue(part['text'].endswith('\n\nتوسط دستیار شخصی'))
+            footer = part['entities'][-1]
+            self.assertEqual(footer['type'], 'text_link')
+            self.assertEqual(footer['url'], 'https://t.me/h_ex_bot')
+            self.assertEqual(part['reply_parameters'], {'message_id': 123})
+            self.assertTrue(part['link_preview_options']['is_disabled'])
+            self.assertLess(part['entities'][0]['length'], footer['offset'])
+            self.assertLessEqual(len(part['text'].encode('utf-16-le')) // 2, 4096)
+        self.assertNotIn('توسط دستیار شخصی', self.bot.history[('A', 20)][-1]['content'])
+
+    def test_error_reply_has_footer_without_stock_introduction(self):
+        self.bot.username = 'h_ex_bot'
+        self.ai.chat.side_effect = ApiError('Ollama')
+        self.dispatch(self.msg())
+        self.assertNotIn('من دستیار', self.sends()[0]['text'])
+        self.assertTrue(self.sends()[0]['text'].endswith('توسط دستیار شخصی'))
+
+    def test_premium_fallback_preserves_footer_link(self):
+        self.bot.username = 'h_ex_bot'
+        self.bot.state.set_reply_emoji('123', '✨')
+        self.ai.chat.return_value = '**سلام**'
+        original = self.tg.call.side_effect
+        def call(method, payload, **kwargs):
+            if method == 'sendMessage' and any(e['type'] == 'custom_emoji' for e in payload.get('entities', [])):
+                raise ApiError('Telegram', 400)
+            return original(method, payload, **kwargs)
+        self.tg.call.side_effect = call
+        self.dispatch(self.msg())
+        self.assertEqual(self.sends()[-1]['entities'][-1]['url'], 'https://t.me/h_ex_bot')
+        self.assertEqual(self.sends()[-1]['entities'][0]['type'], 'bold')
 
     def test_unsent_answer_does_not_mark_conversation_introduced(self):
         self.ai.chat.side_effect = ApiError('Ollama')

@@ -2,10 +2,20 @@ import unittest
 from unittest.mock import Mock
 
 from bot import Config, Telegram
-from formatting import reply_parts
+from formatting import reply_parts, with_assistant_footer
 
 
 class FormattingTests(unittest.TestCase):
+    def test_footer_link_offsets_after_emoji_and_markup(self):
+        part, = reply_parts('😀 **سلام**', True)
+        original = dict(part)
+        result = with_assistant_footer(part, 'https://t.me/h_ex_bot')
+        self.assertEqual(part, original)
+        footer = result['entities'][-1]
+        units = result['text'].encode('utf-16-le')
+        self.assertEqual(units[footer['offset'] * 2:(footer['offset'] + footer['length']) * 2].decode('utf-16-le'), 'دستیار شخصی')
+        self.assertEqual(footer['url'], 'https://t.me/h_ex_bot')
+
     def test_inline_code_and_utf16_offsets(self):
         part, = reply_parts('😀 نام مدل: `gemma3:12b` و **سلام**', True)
         self.assertEqual(part['text'], '😀 نام مدل: gemma3:12b و سلام')
