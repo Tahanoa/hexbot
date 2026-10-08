@@ -9,6 +9,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from bot import ApiError, Bot, LOG
+from formatting import reply_parts
 
 ROOT = Path(__file__).resolve().parent
 
@@ -171,15 +172,15 @@ class BusinessBot(Bot):
         current = self.state.snapshot(key)
         return self.eligible(conn) and self.state.enabled() and current == version
 
-    def send_business(self, key, text, version):
-        for start in range(0, len(text), 2000):
+    def send_business(self, key, text, version, formatted=False):
+        for index, part in enumerate(reply_parts(text, formatted), 1):
             if not self.live(key, version):
                 LOG.info("Reply cancelled before sending; chat ID: %s", key[1])
                 return False
             started = time.perf_counter()
-            LOG.info("Telegram sending; chat ID: %s; part: %s", key[1], start // 2000 + 1)
+            LOG.info("Telegram sending; chat ID: %s; part: %s", key[1], index)
             self.telegram.call("sendMessage", {"business_connection_id": key[0],
-                "chat_id": key[1], "text": text[start:start + 2000]})
+                "chat_id": key[1], **part})
             LOG.info("Telegram accepted reply; chat ID: %s; send: %.2fs", key[1], time.perf_counter() - started)
         return True
 
@@ -439,7 +440,7 @@ class BusinessBot(Bot):
         checked = time.perf_counter()
         self.connection(key[0])
         LOG.info("Telegram permission check finished; chat ID: %s; check: %.2fs", key[1], time.perf_counter() - checked)
-        if not self.send_business(key, answer, version):
+        if not self.send_business(key, answer, version, formatted=True):
             return
         self.state.mark_replied(key)
         if not self.live(key, version):

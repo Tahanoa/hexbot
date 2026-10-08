@@ -48,6 +48,13 @@ class BusinessTests(unittest.TestCase):
         self.assertEqual(self.sends()[0]['chat_id'], 20)
         self.assertIn('صاحب حساب', self.ai.chat.call_args.kwargs['system_prompt'])
 
+    def test_ai_reply_renders_code_in_business_chat(self):
+        self.ai.chat.return_value = 'مدل `gemma3:12b`'
+        self.dispatch(self.msg())
+        reply = self.sends()[0]
+        self.assertEqual(reply['text'], 'مدل gemma3:12b')
+        self.assertEqual(reply['entities'], [{'type': 'code', 'offset': 4, 'length': 10}])
+
     def test_introduction_state_survives_history_clear_and_restart(self):
         prompts = []
         def generate(*args, **kwargs):

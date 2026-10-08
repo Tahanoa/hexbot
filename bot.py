@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
+from formatting import reply_parts
 
 LOG = logging.getLogger("hexbot")
 
@@ -141,12 +142,12 @@ class Telegram:
             raise ApiError("Telegram", data.get("error_code", 0), data.get("parameters", {}).get("retry_after", 0))
         return data["result"]
 
-    def send(self, chat_id: int, text: str):
+    def send(self, chat_id: int, text: str, formatted: bool = False):
         # 2,000 code points also fit within 4,096 UTF-16 units for emoji-only replies.
-        for start in range(0, len(text), 2000):
+        for index, part in enumerate(reply_parts(text, formatted), 1):
             started = time.perf_counter()
-            LOG.info("Telegram sending; chat ID: %s; part: %s", chat_id, start // 2000 + 1)
-            self.call("sendMessage", {"chat_id": chat_id, "text": text[start:start + 2000]})
+            LOG.info("Telegram sending; chat ID: %s; part: %s", chat_id, index)
+            self.call("sendMessage", {"chat_id": chat_id, **part})
             LOG.info("Telegram accepted reply; chat ID: %s; send: %.2fs", chat_id, time.perf_counter() - started)
 
 
@@ -223,7 +224,7 @@ class Bot:
             LOG.warning("%s", exc)
             self.telegram.send(chat_id, "پاسخ از Ollama دریافت نشد. اجرا بودن Ollama، نصب مدل و تنظیمات اتصال را بررسی کن و دوباره پیام بده.")
             return
-        self.telegram.send(chat_id, answer)
+        self.telegram.send(chat_id, answer, formatted=True)
         messages.append({"role": "assistant", "content": answer})
         with self.lock:
             self.history[chat_id] = messages[-self.config.history_turns * 2:]
