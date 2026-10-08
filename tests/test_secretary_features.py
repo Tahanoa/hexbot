@@ -76,6 +76,15 @@ class FeatureTests(unittest.TestCase):
         users = [m['content'] for m in self.ai.chat.call_args.args[0] if m['role'] == 'user']
         self.assertEqual(users, ['سلام دوباره'])
 
+    def test_forget_prevents_late_dialogue_write_and_removes_draft_contents(self):
+        key = ('A', 20)
+        version = self.bot.state.snapshot(key)
+        ident = self.bot.state.create_draft(key, version, 1, 'پاسخ خصوصی', [{'role': 'user', 'content': 'خصوصی'}])
+        self.bot.state.forget(20)
+        self.assertFalse(self.bot.state.save_dialogue(20, [{'role': 'user', 'content': 'قدیمی'}], key, version))
+        self.assertEqual(self.bot.state.dialogue(20)[0], [])
+        self.assertIsNone(self.bot.state.db.execute('SELECT answer FROM drafts WHERE id=?', (ident,)).fetchone())
+
     def test_batching_combines_burst_replies_to_last_message_cleans_waiting(self):
         self.bot.secretary = replace(self.secretary, debounce_seconds=0.02)
         class HoldingPool:
