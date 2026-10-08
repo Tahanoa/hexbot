@@ -241,6 +241,67 @@ class BusinessTests(unittest.TestCase):
         self.assertEqual(self.ai.chat.call_count, 2)
         self.assertEqual({m['chat_id'] for m in self.sends()}, {20, 30})
 
+    def test_only_owner_exact_stop_pauses_one_chat_until_owner_resume(self):
+        self.dispatch(self.msg('/stop', user=10))
+        self.dispatch(self.msg())
+        self.dispatch(self.msg('/resume'))
+        self.dispatch(self.msg('/human درخواست'))
+        self.ai.chat.assert_not_called()
+        self.assertFalse(self.sends())
+        self.assertFalse(self.bot.state.inbox())
+        self.dispatch(self.msg(user=30, chat=30))
+        self.assertEqual(self.ai.chat.call_count, 1)
+        self.dispatch(self.msg('پاسخ دستی', user=10))
+        self.assertTrue(self.bot.state.manually_stopped(20))
+        self.dispatch(self.msg('/resume', user=10))
+        self.dispatch(self.msg())
+        self.assertEqual(self.ai.chat.call_count, 2)
+        self.assertFalse(self.bot.state.manually_stopped(20))
+
+    def test_visitor_commands_forwarded_owner_commands_and_mentions_do_not_stop(self):
+        self.dispatch(self.msg('/stop'))
+        forwarded = self.msg('/stop', user=10)
+        forwarded['forward_origin'] = {'type': 'user'}
+        self.dispatch(forwarded)
+        self.dispatch(self.msg('لطفاً /stop را ببین', user=10))
+        self.dispatch(self.msg('/stop توضیح', user=10))
+        self.assertFalse(self.bot.state.manually_stopped(20))
+        self.dispatch(self.msg())
+        self.assertEqual(self.ai.chat.call_count, 2)
+
+    def test_manual_stop_survives_restart_connection_change_and_global_toggle(self):
+        self.dispatch(self.msg('/stop', user=10))
+        self.bot.state.db.close()
+        self.bot.state = State(self.config.database_path)
+        self.bot.state.set_enabled(False)
+        self.bot.state.set_enabled(True)
+        self.dispatch(self.msg(connection='NEW'))
+        self.ai.chat.assert_not_called()
+        self.bot.owner_command({'chat': {'id': 10}, 'text': '/chats'})
+        self.assertIn('20 — توقف دستی', self.tg.send.call_args.args[1])
+        self.dispatch(self.msg('/resume', user=10, connection='NEW'))
+        self.dispatch(self.msg(connection='NEW'))
+        self.assertEqual(self.ai.chat.call_count, 1)
+
+    def test_explicit_stop_resume_cancels_running_and_queued_replies(self):
+        self.enable_waiting()
+        def generate(*args, **kwargs):
+            self.dispatch(self.msg('پیام بعدی'))
+            self.dispatch(self.msg('/stop', user=10))
+            self.dispatch(self.msg('/resume', user=10))
+            return 'پاسخ قدیمی'
+        self.ai.chat.side_effect = generate
+        self.dispatch(self.msg())
+        self.assertEqual(self.ai.chat.call_count, 1)
+        self.assertFalse(self.bot.busy)
+        self.assertNotIn(('A', 20), self.bot.history)
+        self.assertTrue(all(s['text'] == '⏳' for s in self.sends()))
+        deletions = [c for c in self.tg.call.call_args_list if c.args[0] == 'deleteBusinessMessages']
+        self.assertEqual(len(deletions), 2)
+        self.ai.chat.side_effect = None
+        self.dispatch(self.msg('پیام جدید'))
+        self.assertEqual(self.ai.chat.call_count, 2)
+
     def test_chats_lists_ids_after_restart_and_is_owner_only(self):
         self.dispatch(self.msg(user=10))
         reopened = State(self.config.database_path)

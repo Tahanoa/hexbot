@@ -76,6 +76,8 @@ class State:
             if not any(row[1] == "has_replied" for row in self.db.execute("PRAGMA table_info(chats)")):
                 self.db.execute("ALTER TABLE chats ADD COLUMN has_replied INTEGER NOT NULL DEFAULT 0")
             self.db.execute("CREATE TABLE IF NOT EXISTS requests (id INTEGER PRIMARY KEY, connection TEXT, chat INTEGER, name TEXT, message TEXT, created INTEGER)")
+            # Only explicit owner commands write these new manual stops.
+            self.db.execute("CREATE TABLE IF NOT EXISTS manual_stops (chat INTEGER PRIMARY KEY)")
 
     def enabled(self):
         with self.lock:
@@ -98,6 +100,20 @@ class State:
             self.snapshot(key)
             self.db.execute("UPDATE chats SET version=version+1 WHERE connection=? AND chat=?", key)
 
+    def manually_stopped(self, chat):
+        with self.lock:
+            return self.db.execute('SELECT 1 FROM manual_stops WHERE chat=?', (chat,)).fetchone() is not None
+
+    def set_manual_stop(self, key, stopped):
+        with self.lock, self.db:
+            self.snapshot(key)
+            if stopped:
+                self.db.execute('INSERT OR IGNORE INTO manual_stops(chat) VALUES (?)', (key[1],))
+            else:
+                self.db.execute('DELETE FROM manual_stops WHERE chat=?', (key[1],))
+            # Cancel older queued/in-flight replies even after a quick stop/resume.
+            self.db.execute('UPDATE chats SET version=version+1 WHERE chat=?', (key[1],))
+
     def has_replied(self, key):
         with self.lock:
             row = self.db.execute("SELECT MAX(has_replied) FROM chats WHERE chat=?", (key[1],)).fetchone()
@@ -110,7 +126,7 @@ class State:
 
     def request(self, key, name, text, version):
         with self.lock, self.db:
-            if not self.enabled() or self.snapshot(key) != version:
+            if not self.enabled() or self.manually_stopped(key[1]) or self.snapshot(key) != version:
                 return False
             self.db.execute("INSERT INTO requests(connection,chat,name,message,created) VALUES (?,?,?,?,?)", (*key, name[:200], text[:8000], int(time.time())))
             return True
@@ -181,7 +197,8 @@ class BusinessBot(Bot):
         with self.lock:
             conn = self.connections.get(key[0], {})
         current = self.state.snapshot(key)
-        return self.eligible(conn) and self.state.enabled() and current == version
+        return (self.eligible(conn) and self.state.enabled()
+                and not self.state.manually_stopped(key[1]) and current == version)
 
     def send_business(self, key, text, version, formatted=False, reply_to=None):
         emoji_id, emoji_text = self.state.reply_emoji() if formatted else ('', '')
@@ -286,7 +303,7 @@ class BusinessBot(Bot):
         elif command == "/chats":
             rows = self.state.chats()
             reply = "\n".join(
-                f"شناسه گفتگو: {chat}"
+                f"شناسه گفتگو: {chat}" + (' — توقف دستی' if self.state.manually_stopped(chat) else '')
                 for (chat,) in rows
             ) or "هنوز گفتگویی ثبت نشده؛ از حساب دیگر به حساب شخصی متصل پیام بفرستید."
             if not self.state.enabled():
@@ -360,7 +377,7 @@ class BusinessBot(Bot):
         else:
             reply = ("مدیریت منشی حساب شخصی\n/secretary on — روشن\n/secretary off — خاموش\n"
                      "/status — وضعیت منشی و آخرین اتصال مشاهده‌شده\n/chats — شناسه گفتگوها\n/inbox — ده درخواست آخر\n/clear_inbox — حذف درخواست‌ها\n/waiting — انتخاب ایموجی انتظار\n/emoji — انتخاب ایموجی متحرک پاسخ‌ها\n"
-                     "پاسخ‌گویی فقط برای همه گفتگوها با هم روشن یا خاموش می‌شود.")
+                     "در پیوی شخص، از حساب خودت /stop بفرست تا فقط همان گفتگو متوقف شود؛ /resume برای ادامه.")
         self.telegram.send(chat, reply)
 
     def dispatch_update(self, update, pool):
@@ -416,8 +433,17 @@ class BusinessBot(Bot):
             return
         key = (ident, msg["chat"]["id"])
         if msg.get("from", {}).get("id") == self.secretary.owner_id:
-            LOG.info("Owner outgoing message skipped; automatic replies remain enabled")
             self.state.snapshot(key)
+            command = msg.get('text', '').strip()
+            if command in ('/stop', '/resume') and not msg.get('forward_origin'):
+                self.state.set_manual_stop(key, command == '/stop')
+                LOG.info('Owner explicitly %s automatic replies; chat ID: %s',
+                         'stopped' if command == '/stop' else 'resumed', key[1])
+            else:
+                LOG.info('Owner outgoing message skipped; manual stop state unchanged')
+            return
+        if self.state.manually_stopped(key[1]):
+            LOG.info('Business message ignored: explicitly stopped by owner; chat ID: %s', key[1])
             return
         if msg.get("from", {}).get("is_bot") or not self.eligible(conn) or not self.state.enabled():
             LOG.info("Business message ignored: bot sender, disabled secretary/connection or missing reply permission")
