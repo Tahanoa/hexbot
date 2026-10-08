@@ -5,7 +5,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock
-from bot import Config
+from bot import ApiError, Config
 from business import BusinessBot, SecretaryConfig, State
 
 
@@ -47,6 +47,107 @@ class BusinessTests(unittest.TestCase):
         self.assertEqual(self.sends()[0]['business_connection_id'], 'A')
         self.assertEqual(self.sends()[0]['chat_id'], 20)
         self.assertIn('صاحب حساب', self.ai.chat.call_args.kwargs['system_prompt'])
+
+    def enable_waiting(self):
+        self.conn['rights']['can_delete_sent_messages'] = True
+        counter = iter(range(100, 1000))
+        def call(method, data, **kwargs):
+            if method == 'getBusinessConnection':
+                return dict(self.conn)
+            if method == 'sendMessage':
+                return {'message_id': next(counter)}
+            return True
+        self.tg.call.side_effect = call
+        return call
+
+    def test_waiting_precedes_ai_and_deleted_after_reply_without_cancelling_next(self):
+        self.enable_waiting()
+        def generate(*args, **kwargs):
+            self.assertEqual(self.sends()[-1]['text'], '⏳')
+            return 'answer'
+        self.ai.chat.side_effect = generate
+        self.dispatch(self.msg())
+        methods = [c.args[0] for c in self.tg.call.call_args_list]
+        self.assertEqual(methods, ['getBusinessConnection', 'sendMessage',
+            'getBusinessConnection', 'sendMessage', 'deleteBusinessMessages'])
+        self.assertEqual(self.tg.call.call_args.args[1]['message_ids'], [100])
+        version = self.bot.state.snapshot(('A', 20))
+        self.bot.dispatch_update({'deleted_business_messages': {'business_connection_id': 'A',
+            'chat': {'id': 20}, 'message_ids': [100]}}, self.pool)
+        self.assertEqual(self.bot.state.snapshot(('A', 20)), version)
+        self.dispatch(self.msg())
+        self.assertEqual(self.ai.chat.call_count, 2)
+
+    def test_waiting_deleted_when_ai_fails(self):
+        self.enable_waiting()
+        self.ai.chat.side_effect = ApiError('Ollama')
+        self.dispatch(self.msg())
+        self.assertEqual(self.tg.call.call_args.args[0], 'deleteBusinessMessages')
+        self.assertEqual(len(self.sends()), 2)
+
+    def test_waiting_deletion_update_does_not_cancel_queued_reply(self):
+        base = self.enable_waiting()
+        generated = []
+        def generate(messages, **kwargs):
+            generated.append(messages[-1]['content'])
+            if len(generated) == 1:
+                self.dispatch(self.msg('next'))
+            return 'answer'
+        def call(method, data, **kwargs):
+            if method == 'deleteBusinessMessages':
+                self.bot.dispatch_update({'deleted_business_messages': {
+                    'business_connection_id': 'A', 'chat': {'id': 20},
+                    'message_ids': data['message_ids']}}, self.pool)
+            return base(method, data, **kwargs)
+        self.tg.call.side_effect = call
+        self.ai.chat.side_effect = generate
+        self.dispatch(self.msg('first'))
+        self.assertEqual(generated, ['first', 'next'])
+        self.assertEqual([s['text'] for s in self.sends()].count('answer'), 2)
+
+    def test_premium_waiting_saved_with_utf16_entity_and_falls_back(self):
+        base = self.enable_waiting()
+        emoji = '🕰️'
+        self.bot.dispatch_update({'message': {'chat': {'id': 10, 'type': 'private'},
+            'from': {'id': 10}, 'text': emoji, 'entities': [{'type': 'custom_emoji',
+                'offset': 0, 'length': 3, 'custom_emoji_id': '12345'}]}}, self.pool)
+        reopened = State(self.config.database_path)
+        try:
+            self.assertEqual(reopened.waiting_emoji(), ('12345', emoji))
+        finally:
+            reopened.db.close()
+        def call(method, data, **kwargs):
+            if method == 'sendMessage' and data.get('entities'):
+                self.assertEqual(data['entities'][0]['length'], 3)
+                raise ApiError('Telegram', 400)
+            return base(method, data, **kwargs)
+        self.tg.call.side_effect = call
+        self.dispatch(self.msg())
+        self.assertEqual(self.sends()[1]['text'], '⏳')
+        self.assertNotIn('entities', self.sends()[1])
+        self.assertEqual(self.tg.call.call_args.args[0], 'deleteBusinessMessages')
+
+    def test_waiting_delivery_failure_does_not_block_ai(self):
+        base = self.enable_waiting()
+        def call(method, data, **kwargs):
+            if method == 'sendMessage' and data['text'] == '⏳':
+                raise ApiError('Telegram', 500)
+            return base(method, data, **kwargs)
+        self.tg.call.side_effect = call
+        self.dispatch(self.msg())
+        self.ai.chat.assert_called_once()
+        self.assertEqual(self.sends()[-1]['text'], self.ai.chat.return_value)
+
+    def test_waiting_cleanup_failure_does_not_lose_answer_or_history(self):
+        base = self.enable_waiting()
+        def call(method, data, **kwargs):
+            if method == 'deleteBusinessMessages':
+                raise ApiError('Telegram', 403)
+            return base(method, data, **kwargs)
+        self.tg.call.side_effect = call
+        self.dispatch(self.msg())
+        self.assertEqual(self.sends()[-1]['text'], self.ai.chat.return_value)
+        self.assertIn(('A', 20), self.bot.history)
 
     def test_manual_reply_does_not_disable_other_or_same_chat(self):
         self.dispatch(self.msg(user=10))

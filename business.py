@@ -5,6 +5,7 @@ import os
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from bot import ApiError, Bot, LOG
@@ -107,6 +108,16 @@ class State:
         with self.lock, self.db:
             self.db.execute("DELETE FROM requests")
 
+    def waiting_emoji(self):
+        with self.lock:
+            rows = dict(self.db.execute("SELECT key, value FROM settings WHERE key IN ('waiting_id', 'waiting_text')"))
+            return str(rows.get('waiting_id', '')), str(rows.get('waiting_text', '⏳'))
+
+    def set_waiting_emoji(self, ident='', text='⏳'):
+        with self.lock, self.db:
+            self.db.executemany("INSERT OR REPLACE INTO settings VALUES (?, ?)",
+                                [('waiting_id', ident), ('waiting_text', text)])
+
 
 class BusinessBot(Bot):
     def __init__(self, config, secretary, telegram=None, ollama=None):
@@ -116,6 +127,7 @@ class BusinessBot(Bot):
         self.state = State(secretary.database_path)
         self.connections = {}
         self.pending = {}
+        self.deleted_waiting = OrderedDict()
         LOG.info("Secretary mode enabled; owner ID: %s; context tokens: %s; profile loaded",
                  secretary.owner_id, config.context_length)
 
@@ -152,8 +164,65 @@ class BusinessBot(Bot):
             LOG.info("Telegram accepted reply; chat ID: %s; send: %.2fs", key[1], time.perf_counter() - started)
         return True
 
+    def show_waiting(self, key, version):
+        with self.lock:
+            rights = self.connections.get(key[0], {}).get('rights', {})
+        if not (rights.get('can_delete_sent_messages') or rights.get('can_delete_all_messages')):
+            LOG.warning("Waiting emoji skipped; enable deletion of bot-sent messages; chat ID: %s", key[1])
+            return None
+        if not self.live(key, version):
+            return None
+        ident, text = self.state.waiting_emoji()
+        payload = {'business_connection_id': key[0], 'chat_id': key[1],
+                   'text': text, 'disable_notification': True}
+        if ident:
+            payload['entities'] = [{'type': 'custom_emoji', 'offset': 0,
+                'length': len(text.encode('utf-16-le')) // 2, 'custom_emoji_id': ident}]
+        try:
+            try:
+                result = self.telegram.call('sendMessage', payload, timeout=10)
+            except ApiError as exc:
+                if not ident or exc.status != 400:
+                    raise
+                LOG.warning("Premium waiting emoji rejected; using ordinary hourglass")
+                payload = dict(payload)
+                payload.pop('entities', None)
+                payload['text'] = '⏳'
+                result = self.telegram.call('sendMessage', payload, timeout=10)
+            if isinstance(result, dict) and isinstance(result.get('message_id'), int):
+                LOG.info("Waiting emoji sent; chat ID: %s", key[1])
+                return result['message_id']
+        except ApiError as exc:
+            LOG.warning("Waiting emoji failed; %s", exc)
+        return None
+
+    def remove_waiting(self, key, message):
+        ident = message.pop('_waiting_message_id', None)
+        if ident is None:
+            return
+        # Our deletion update must not cancel replies queued in the same chat.
+        with self.lock:
+            self.deleted_waiting[(*key, ident)] = None
+            while len(self.deleted_waiting) > 1000:
+                self.deleted_waiting.popitem(last=False)
+        try:
+            self.telegram.call('deleteBusinessMessages', {'business_connection_id': key[0],
+                'message_ids': [ident]}, timeout=10)
+            LOG.info("Waiting emoji deleted; chat ID: %s", key[1])
+        except ApiError as exc:
+            LOG.warning("Waiting emoji deletion failed; chat ID: %s; %s", key[1], exc)
+
     def owner_command(self, message):
         chat = message["chat"]["id"]
+        text = message.get('text', '')
+        entities = message.get('entities', [])
+        if (len(entities) == 1 and entities[0].get('type') == 'custom_emoji'
+                and entities[0].get('offset') == 0
+                and entities[0].get('length') == len(text.encode('utf-16-le')) // 2
+                and str(entities[0].get('custom_emoji_id', '')).isdigit()):
+            self.state.set_waiting_emoji(str(entities[0]['custom_emoji_id']), text)
+            self.telegram.send(chat, 'ایموجی انتظار ذخیره شد. اگر تلگرام نسخه پریمیوم را نپذیرد، ⏳ معمولی ارسال می‌شود.')
+            return
         parts = message.get("text", "").strip().split(maxsplit=1)
         command = parts[0].split("@")[0].lower() if parts else ""
         arg = parts[1] if len(parts) > 1 else ""
@@ -183,15 +252,22 @@ class BusinessBot(Bot):
                 reply += (f"\nاتصال {index}: "
                           f"مالک مطابق: {'بله' if conn.get('user', {}).get('id') == self.secretary.owner_id else 'خیر'}؛ "
                           f"فعال: {'بله' if conn.get('is_enabled') else 'خیر'}؛ "
-                          f"اجازه پاسخ: {'بله' if conn.get('rights', {}).get('can_reply', conn.get('can_reply', False)) else 'خیر'}")
+                          f"اجازه پاسخ: {'بله' if conn.get('rights', {}).get('can_reply', conn.get('can_reply', False)) else 'خیر'}؛ "
+                          f"حذف پیام انتظار: {'بله' if conn.get('rights', {}).get('can_delete_sent_messages') or conn.get('rights', {}).get('can_delete_all_messages') else 'خیر'}")
         elif command == "/clear_inbox":
             self.state.clear_inbox()
             reply = "درخواست‌های ثبت‌شده پاک شدند."
         elif command == "/whoami":
             reply = f"شناسه شما: {self.secretary.owner_id}"
+        elif command == "/waiting":
+            if arg == 'default':
+                self.state.set_waiting_emoji()
+                reply = 'ایموجی انتظار به ⏳ معمولی برگشت.'
+            else:
+                reply = 'برای انتخاب، فقط یک ایموجی پریمیوم ساعت یا ساعت شنی در همین چت بفرست. برای حالت معمولی: /waiting default'
         else:
             reply = ("مدیریت منشی حساب شخصی\n/secretary on — روشن\n/secretary off — خاموش\n"
-                     "/status — وضعیت منشی و آخرین اتصال مشاهده‌شده\n/chats — شناسه گفتگوها\n/inbox — ده درخواست آخر\n/clear_inbox — حذف درخواست‌ها\n"
+                     "/status — وضعیت منشی و آخرین اتصال مشاهده‌شده\n/chats — شناسه گفتگوها\n/inbox — ده درخواست آخر\n/clear_inbox — حذف درخواست‌ها\n/waiting — انتخاب ایموجی انتظار\n"
                      "پاسخ‌گویی فقط برای همه گفتگوها با هم روشن یا خاموش می‌شود.")
         self.telegram.send(chat, reply)
 
@@ -211,6 +287,16 @@ class BusinessBot(Bot):
         if "deleted_business_messages" in update:
             msg = update["deleted_business_messages"]
             key = (msg["business_connection_id"], msg["chat"]["id"])
+            with self.lock:
+                others = []
+                for ident in msg.get('message_ids', []):
+                    marker = (*key, ident)
+                    if marker in self.deleted_waiting:
+                        self.deleted_waiting.pop(marker)
+                    else:
+                        others.append(ident)
+            if not others:
+                return
             self.state.invalidate(key)
             with self.lock:
                 self.history.pop(key, None)
@@ -251,6 +337,8 @@ class BusinessBot(Bot):
         if msg.get("text", "").strip().split(maxsplit=1)[:1] == ["/human"]:
             self.business_respond(msg, key, version)
             return
+        if msg.get('text', '').strip() and len(msg['text'].strip()) <= 8000:
+            msg['_waiting_message_id'] = self.show_waiting(key, version)
         with self.lock:
             if key in self.busy:
                 queue = self.pending.setdefault(key, [])
@@ -264,7 +352,10 @@ class BusinessBot(Bot):
                 full = False
                 self.busy.add(key)
         if full:
-            self.send_business(key, "من دستیار خودکار این حساب هستم؛ در حال حاضر ظرفیت پاسخ‌گویی پر است. لطفاً کمی بعد دوباره پیام بده.", version)
+            try:
+                self.send_business(key, "من دستیار خودکار این حساب هستم؛ در حال حاضر ظرفیت پاسخ‌گویی پر است. لطفاً کمی بعد دوباره پیام بده.", version)
+            finally:
+                self.remove_waiting(key, msg)
         else:
             pool.submit(self.business_work, msg, key, version)
 
@@ -276,6 +367,8 @@ class BusinessBot(Bot):
                 LOG.warning("%s", exc)
             except Exception:
                 LOG.error("Unexpected secretary processing error")
+            finally:
+                self.remove_waiting(key, message)
             with self.lock:
                 queue = self.pending.get(key, [])
                 if queue:
