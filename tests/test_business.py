@@ -48,6 +48,27 @@ class BusinessTests(unittest.TestCase):
         self.assertEqual(self.sends()[0]['chat_id'], 20)
         self.assertIn('صاحب حساب', self.ai.chat.call_args.kwargs['system_prompt'])
 
+    def test_introduction_state_survives_history_clear_and_restart(self):
+        prompts = []
+        def generate(*args, **kwargs):
+            prompts.append(kwargs['system_prompt'])
+            return 'answer'
+        self.ai.chat.side_effect = generate
+        self.dispatch(self.msg())
+        self.assertIn('این اولین پاسخ', prompts[-1])
+        self.bot.history.clear()
+        self.bot.state.db.close()
+        self.bot.state = State(self.config.database_path)
+        self.dispatch(self.msg(connection='NEW'))
+        self.assertIn('خودت را دوباره معرفی نکن', prompts[-1])
+        self.dispatch(self.msg(user=30, chat=30))
+        self.assertIn('این اولین پاسخ', prompts[-1])
+
+    def test_unsent_answer_does_not_mark_conversation_introduced(self):
+        self.ai.chat.side_effect = ApiError('Ollama')
+        self.dispatch(self.msg())
+        self.assertFalse(self.bot.state.has_replied(('A', 20)))
+
     def enable_waiting(self):
         self.conn['rights']['can_delete_sent_messages'] = True
         counter = iter(range(100, 1000))
