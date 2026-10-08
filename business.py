@@ -143,9 +143,13 @@ class BusinessBot(Bot):
     def send_business(self, key, text, version):
         for start in range(0, len(text), 2000):
             if not self.live(key, version):
+                LOG.info("Reply cancelled before sending; chat ID: %s", key[1])
                 return False
+            started = time.perf_counter()
+            LOG.info("Telegram sending; chat ID: %s; part: %s", key[1], start // 2000 + 1)
             self.telegram.call("sendMessage", {"business_connection_id": key[0],
                 "chat_id": key[1], "text": text[start:start + 2000]})
+            LOG.info("Telegram accepted reply; chat ID: %s; send: %.2fs", key[1], time.perf_counter() - started)
         return True
 
     def owner_command(self, message):
@@ -221,6 +225,7 @@ class BusinessBot(Bot):
             return
         msg = update.get("business_message", {})
         if msg:
+            msg["_received_at"] = time.perf_counter()
             LOG.info("Business message received; chat ID: %s", msg.get("chat", {}).get("id"))
         ident = msg.get("business_connection_id")
         if not ident or msg.get("chat", {}).get("type") != "private" or msg.get("via_bot") or msg.get("via_business_bot"):
@@ -302,14 +307,20 @@ class BusinessBot(Bot):
         with self.lock:
             messages = list(self.history.get(key, []))
         messages.append({"role": "user", "content": text})
+        started = time.perf_counter()
+        LOG.info("AI request started; chat ID: %s; wait before AI: %.2fs", key[1],
+                 started - message.get("_received_at", started))
         try:
             answer = self.ollama.chat(messages, system_prompt=self.prompt)
         except ApiError as exc:
-            LOG.warning("%s", exc)
+            LOG.warning("AI request failed; chat ID: %s; elapsed: %.2fs; %s", key[1], time.perf_counter() - started, exc)
             self.send_business(key, "من دستیار خودکار این حساب هستم؛ فعلاً امکان پاسخ‌گویی ندارم. لطفاً کمی بعد دوباره پیام بده.", version)
             return
+        LOG.info("AI response ready; chat ID: %s; AI request: %.2fs", key[1], time.perf_counter() - started)
         # Recheck actual Telegram permissions after a potentially long local generation.
+        checked = time.perf_counter()
         self.connection(key[0])
+        LOG.info("Telegram permission check finished; chat ID: %s; check: %.2fs", key[1], time.perf_counter() - checked)
         if not self.send_business(key, answer, version):
             return
         if not self.live(key, version):

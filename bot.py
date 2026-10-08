@@ -9,6 +9,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -143,7 +144,10 @@ class Telegram:
     def send(self, chat_id: int, text: str):
         # 2,000 code points also fit within 4,096 UTF-16 units for emoji-only replies.
         for start in range(0, len(text), 2000):
+            started = time.perf_counter()
+            LOG.info("Telegram sending; chat ID: %s; part: %s", chat_id, start // 2000 + 1)
             self.call("sendMessage", {"chat_id": chat_id, "text": text[start:start + 2000]})
+            LOG.info("Telegram accepted reply; chat ID: %s; send: %.2fs", chat_id, time.perf_counter() - started)
 
 
 class Ollama:
@@ -159,6 +163,13 @@ class Ollama:
         answer = data.get("message", {}).get("content", "")
         if data.get("error") or not isinstance(answer, str) or not answer.strip():
             raise ApiError("Ollama")
+        def metric(name):
+            value = data.get(name, 0)
+            return value if isinstance(value, (int, float)) and value >= 0 else 0
+        duration = metric("eval_duration") / 1e9
+        LOG.info("Ollama timings; load: %.2fs; prompt: %.2fs; generation: %.2fs; output tokens: %s; tokens/s: %.1f",
+                 metric("load_duration") / 1e9, metric("prompt_eval_duration") / 1e9,
+                 duration, metric("eval_count"), metric("eval_count") / duration if duration else 0)
         return answer.strip()
 
 
