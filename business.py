@@ -212,6 +212,7 @@ class BusinessBot(SecretaryTools, Bot):
         try:
             super().run()
         finally:
+            self.stop.set()
             self.management_pool.shutdown(wait=True, cancel_futures=True)
             self.state.db.close()
 
@@ -525,8 +526,8 @@ class BusinessBot(SecretaryTools, Bot):
 
     def business_work(self, message, key, version):
         while True:
-            message = self.collect_batch(key, message, version)
             try:
+                message = self.collect_batch(key, message, version)
                 self.business_respond(message, key, version)
             except ApiError as exc:
                 LOG.warning("%s", exc)
@@ -647,7 +648,7 @@ class BusinessBot(SecretaryTools, Bot):
         with self.lock:
             messages.append({"role": "assistant", "content": answer})
             self.history[key] = messages[-self.config.history_turns * 2:]
-            self.state.save_dialogue(key[1], self.history[key])
+            self.state.save_dialogue(key[1], self.history[key], key, version)
             self.history.move_to_end(key)
             while len(self.history) > self.config.max_chats:
                 self.history.popitem(last=False)

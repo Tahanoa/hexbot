@@ -56,11 +56,14 @@ class FeatureState:
             row = self.db.execute('SELECT history,summary,memory_version FROM dialogue WHERE chat=?', (chat,)).fetchone()
             return (json.loads(row[0]), row[1], row[2]) if row else ([], '', 0)
 
-    def save_dialogue(self, chat, history):
+    def save_dialogue(self, chat, history, key=None, version=None):
         with self.lock, self.db:
+            if key is not None and self.snapshot(key) != version:
+                return False
             self.db.execute('''INSERT INTO dialogue(chat,history) VALUES (?,?)
                 ON CONFLICT(chat) DO UPDATE SET history=excluded.history''',
                 (chat, json.dumps(history, ensure_ascii=False)))
+            return True
 
     def save_summary(self, chat, summary, expected_version):
         with self.lock, self.db:
@@ -76,7 +79,7 @@ class FeatureState:
             self.db.execute("UPDATE dialogue SET history='[]', summary='', memory_version=memory_version+1 WHERE chat=?", (chat,))
             self.db.execute('DELETE FROM archive WHERE chat=?', (chat,))
             self.db.execute('UPDATE chats SET version=version+1 WHERE chat=?', (chat,))
-            self.db.execute("UPDATE drafts SET status='cancelled' WHERE chat=? AND status='pending'", (chat,))
+            self.db.execute('DELETE FROM drafts WHERE chat=?', (chat,))
 
     def remove_archived(self, chat, message_ids):
         with self.lock, self.db:

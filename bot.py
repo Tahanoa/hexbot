@@ -161,14 +161,18 @@ class Ollama:
         self.config = config
         self.client = JsonClient(config.ollama_url, "Ollama", proxy="")
 
-    def chat(self, messages: list[dict], system_prompt: str | None = None) -> str:
+    def chat(self, messages: list[dict], system_prompt: str | None = None,
+             response_format=None, max_tokens=None) -> str:
         prompt = self.config.system_prompt if system_prompt is None else system_prompt
         if PRESENTATION_PROMPT not in prompt:
             prompt += '\n\n' + PRESENTATION_PROMPT
-        data = self.client.post("/api/chat", {"model": self.config.model,
+        payload = {"model": self.config.model,
             "messages": [{"role": "system", "content": prompt}] + messages,
-            "stream": False, "options": {"num_predict": 2048,
-                "num_ctx": self.config.context_length}}, self.config.timeout)
+            "stream": False, "options": {"num_predict": max_tokens or 2048,
+                "num_ctx": self.config.context_length}}
+        if response_format is not None:
+            payload['format'] = response_format
+        data = self.client.post("/api/chat", payload, self.config.timeout)
         answer = data.get("message", {}).get("content", "")
         if data.get("error") or not isinstance(answer, str) or not answer.strip():
             raise ApiError("Ollama")

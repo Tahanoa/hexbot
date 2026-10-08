@@ -159,7 +159,7 @@ class SecretaryTools:
             self.state.finish_draft(ident, 'sent')
             history = draft['messages'] + [{'role': 'assistant', 'content': draft['answer']}]
             if self.live(key, version):
-                self.state.save_dialogue(key[1], history[-self.config.history_turns * 2:])
+                self.state.save_dialogue(key[1], history[-self.config.history_turns * 2:], key, version)
             self.state.mark_replied(key)
             return f'پاسخ پیش‌نویس #{ident} ارسال شد.'
         except Exception as exc:
