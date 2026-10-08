@@ -8,8 +8,9 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 from bot import ApiError, Bot, LOG
-from formatting import reply_parts
+from formatting import PRESENTATION_PROMPT, reply_parts
 
 ROOT = Path(__file__).resolve().parent
 
@@ -138,6 +139,16 @@ class State:
             self.db.executemany("INSERT OR REPLACE INTO settings VALUES (?, ?)",
                                 [('waiting_id', ident), ('waiting_text', text)])
 
+    def reply_emoji(self):
+        with self.lock:
+            rows = dict(self.db.execute("SELECT key, value FROM settings WHERE key IN ('reply_emoji_id', 'reply_emoji_text')"))
+            return str(rows.get('reply_emoji_id', '')), str(rows.get('reply_emoji_text', ''))
+
+    def set_reply_emoji(self, ident='', text=''):
+        with self.lock, self.db:
+            self.db.executemany("INSERT OR REPLACE INTO settings VALUES (?, ?)",
+                                [('reply_emoji_id', ident), ('reply_emoji_text', text)])
+
 
 class BusinessBot(Bot):
     def __init__(self, config, secretary, telegram=None, ollama=None):
@@ -172,15 +183,35 @@ class BusinessBot(Bot):
         current = self.state.snapshot(key)
         return self.eligible(conn) and self.state.enabled() and current == version
 
-    def send_business(self, key, text, version, formatted=False):
+    def send_business(self, key, text, version, formatted=False, reply_to=None):
+        emoji_id, emoji_text = self.state.reply_emoji() if formatted else ('', '')
         for index, part in enumerate(reply_parts(text, formatted), 1):
             if not self.live(key, version):
                 LOG.info("Reply cancelled before sending; chat ID: %s", key[1])
                 return False
             started = time.perf_counter()
             LOG.info("Telegram sending; chat ID: %s; part: %s", key[1], index)
-            self.telegram.call("sendMessage", {"business_connection_id": key[0],
-                "chat_id": key[1], **part})
+            payload = {"business_connection_id": key[0], "chat_id": key[1], **part}
+            if isinstance(reply_to, int) and reply_to > 0:
+                payload['reply_parameters'] = {'message_id': reply_to}
+            if index == 1 and emoji_id and emoji_text:
+                prefix = emoji_text + ' '
+                shift = len(prefix.encode('utf-16-le')) // 2
+                payload['text'] = prefix + part['text']
+                payload['entities'] = [{'type': 'custom_emoji', 'offset': 0,
+                    'length': shift - 1, 'custom_emoji_id': emoji_id}] + [
+                    dict(entity, offset=entity['offset'] + shift) for entity in part.get('entities', [])]
+            try:
+                self.telegram.call('sendMessage', payload)
+            except ApiError as exc:
+                if exc.status != 400 or not any(e['type'] == 'custom_emoji' for e in payload.get('entities', [])):
+                    raise
+                LOG.warning('Reply with premium emoji rejected; retrying with ordinary emoji; chat ID: %s', key[1])
+                fallback = dict(payload)
+                fallback['entities'] = [e for e in payload['entities'] if e['type'] != 'custom_emoji']
+                if not self.live(key, version):
+                    return False
+                self.telegram.call('sendMessage', fallback)
             LOG.info("Telegram accepted reply; chat ID: %s; send: %.2fs", key[1], time.perf_counter() - started)
         return True
 
@@ -279,6 +310,47 @@ class BusinessBot(Bot):
             reply = "درخواست‌های ثبت‌شده پاک شدند."
         elif command == "/whoami":
             reply = f"شناسه شما: {self.secretary.owner_id}"
+        elif command == '/emoji':
+            if arg == 'off':
+                self.state.set_reply_emoji()
+                reply = 'ایموجی پریمیوم پاسخ‌ها غیرفعال شد.'
+            elif arg.isdigit():
+                try:
+                    stickers = self.telegram.call('getCustomEmojiStickers', {'custom_emoji_ids': [arg]})
+                    sticker = next((s for s in stickers if s.get('custom_emoji_id') == arg), None) if isinstance(stickers, list) else None
+                    if not sticker or not sticker.get('emoji') or not (sticker.get('is_animated') or sticker.get('is_video')):
+                        reply = 'این شناسه متعلق به ایموجی متحرک قابل استفاده نیست؛ شناسه دیگری بده.'
+                    else:
+                        self.state.set_reply_emoji(arg, sticker['emoji'])
+                        reply = 'ایموجی متحرک پاسخ‌ها ذخیره شد. اگر تلگرام نپذیرد، نسخه معمولی نمایش داده می‌شود.'
+                except ApiError as exc:
+                    LOG.warning('Reply emoji lookup failed; %s', exc)
+                    reply = 'اطلاعات ایموجی دریافت نشد؛ شناسه و اتصال تلگرام را بررسی کن.'
+            elif arg.startswith('https://t.me/addemoji/'):
+                link, _, wanted = arg.partition(' ')
+                parsed = urlsplit(link)
+                name = parsed.path.removeprefix('/addemoji/')
+                if parsed.netloc != 't.me' or not name or '/' in name:
+                    reply = 'لینک کامل پک را بفرست: https://t.me/addemoji/نام_پک'
+                else:
+                    try:
+                        pack = self.telegram.call('getStickerSet', {'name': name})
+                        matches = [s for s in pack.get('stickers', []) if s.get('custom_emoji_id')
+                            and (s.get('is_animated') or s.get('is_video'))
+                            and (not wanted.strip() or s.get('emoji', '').replace('\ufe0f', '') == wanted.strip().replace('\ufe0f', ''))]
+                        reply = '\n'.join(f"{s.get('emoji', '')} — /emoji {s['custom_emoji_id']}" for s in matches[:20])
+                        reply = ('گزینه‌های متحرک پک؛ برای انتخاب، دستور روبه‌روی گزینه را بفرست:\n\n' + reply
+                                 if reply else 'ایموجی متحرک مطابق این انتخاب در پک پیدا نشد.')
+                        if len(matches) > 20:
+                            reply += '\n\nفقط ۲۰ گزینه اول نمایش داده شد؛ برای محدودکردن، بعد از لینک یک ایموجی معمولی بگذار.'
+                    except ApiError as exc:
+                        LOG.warning('Reply emoji pack lookup failed; %s', exc)
+                        reply = 'پک دریافت نشد؛ لینک و اتصال تلگرام را بررسی کن.'
+            else:
+                reply = ('برای پیدا کردن شناسه بدون ارسال ایموجی پریمیوم:\n'
+                         '/emoji https://t.me/addemoji/نام_پک ✨\n\n'
+                         'برای انتخاب: /emoji شناسه_عددی_ایموجی\nبرای خاموش‌کردن: /emoji off\n'
+                         'عدد انتهای لینک پست، شناسه ایموجی نیست.')
         elif command == "/waiting":
             if arg == 'default':
                 self.state.set_waiting_emoji()
@@ -287,7 +359,7 @@ class BusinessBot(Bot):
                 reply = 'برای انتخاب، فقط یک ایموجی پریمیوم ساعت یا ساعت شنی در همین چت بفرست. برای حالت معمولی: /waiting default'
         else:
             reply = ("مدیریت منشی حساب شخصی\n/secretary on — روشن\n/secretary off — خاموش\n"
-                     "/status — وضعیت منشی و آخرین اتصال مشاهده‌شده\n/chats — شناسه گفتگوها\n/inbox — ده درخواست آخر\n/clear_inbox — حذف درخواست‌ها\n/waiting — انتخاب ایموجی انتظار\n"
+                     "/status — وضعیت منشی و آخرین اتصال مشاهده‌شده\n/chats — شناسه گفتگوها\n/inbox — ده درخواست آخر\n/clear_inbox — حذف درخواست‌ها\n/waiting — انتخاب ایموجی انتظار\n/emoji — انتخاب ایموجی متحرک پاسخ‌ها\n"
                      "پاسخ‌گویی فقط برای همه گفتگوها با هم روشن یا خاموش می‌شود.")
         self.telegram.send(chat, reply)
 
@@ -402,20 +474,21 @@ class BusinessBot(Bot):
         if not self.live(key, version):
             return
         text = message.get("text", "").strip()
+        reply_to = message.get('message_id')
         if not text or len(text) > 8000:
-            self.send_business(key, "من دستیار خودکار این حساب هستم. لطفاً درخواستت را در یک پیام متنی کوتاه بفرست.", version)
+            self.send_business(key, "من دستیار خودکار این حساب هستم. لطفاً درخواستت را در یک پیام متنی کوتاه بفرست.", version, reply_to=reply_to)
             return
         if text.split(maxsplit=1)[0].lower() == "/human":
             note = text.partition(" ")[2].strip()
             if not note:
-                self.send_business(key, "برای ثبت پیام به صاحب حساب، بنویس: /human متن درخواست", version)
+                self.send_business(key, "برای ثبت پیام به صاحب حساب، بنویس: /human متن درخواست", version, reply_to=reply_to)
                 return
             # Confirm only after successfully storing the request.
             if not self.live(key, version):
                 return
             if not self.state.request(key, message.get("from", {}).get("first_name", ""), note, version):
                 return
-            self.send_business(key, "پیامت برای بررسی صاحب حساب ثبت شد؛ زمان پاسخ ایشان مشخص نیست. پاسخ‌گویی خودکار همچنان فعال است.", version)
+            self.send_business(key, "پیامت برای بررسی صاحب حساب ثبت شد؛ زمان پاسخ ایشان مشخص نیست. پاسخ‌گویی خودکار همچنان فعال است.", version, reply_to=reply_to)
             return
         with self.lock:
             messages = list(self.history.get(key, []))
@@ -430,17 +503,17 @@ class BusinessBot(Bot):
                 if self.state.has_replied(key) or any(m.get('role') == 'assistant' for m in messages)
                 else "این اولین پاسخ این گفتگو است؛ یک‌بار خیلی کوتاه بگو دستیار خودکار این حساب هستی، سپس مستقیم جواب پیام را بده."
             )
-            answer = self.ollama.chat(messages, system_prompt=self.prompt + "\n\nوضعیت فعلی گفتگو:\n" + introduction)
+            answer = self.ollama.chat(messages, system_prompt=self.prompt + '\n\n' + PRESENTATION_PROMPT + "\n\nوضعیت فعلی گفتگو:\n" + introduction)
         except ApiError as exc:
             LOG.warning("AI request failed; chat ID: %s; elapsed: %.2fs; %s", key[1], time.perf_counter() - started, exc)
-            self.send_business(key, "من دستیار خودکار این حساب هستم؛ فعلاً امکان پاسخ‌گویی ندارم. لطفاً کمی بعد دوباره پیام بده.", version)
+            self.send_business(key, "من دستیار خودکار این حساب هستم؛ فعلاً امکان پاسخ‌گویی ندارم. لطفاً کمی بعد دوباره پیام بده.", version, reply_to=reply_to)
             return
         LOG.info("AI response ready; chat ID: %s; AI request: %.2fs", key[1], time.perf_counter() - started)
         # Recheck actual Telegram permissions after a potentially long local generation.
         checked = time.perf_counter()
         self.connection(key[0])
         LOG.info("Telegram permission check finished; chat ID: %s; check: %.2fs", key[1], time.perf_counter() - checked)
-        if not self.send_business(key, answer, version, formatted=True):
+        if not self.send_business(key, answer, version, formatted=True, reply_to=reply_to):
             return
         self.state.mark_replied(key)
         if not self.live(key, version):

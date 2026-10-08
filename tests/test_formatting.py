@@ -37,3 +37,18 @@ class FormattingTests(unittest.TestCase):
         telegram.send(10, '`code`', formatted=True)
         telegram.call.assert_called_once_with('sendMessage', {'chat_id': 10,
             'text': 'code', 'entities': [{'type': 'code', 'offset': 0, 'length': 4}]})
+
+    def test_long_reply_parts_prefer_paragraph_boundaries(self):
+        source = 'a' * 1500 + '\n\n' + 'b' * 1500
+        parts = list(reply_parts(source))
+        self.assertEqual(parts[0]['text'], 'a' * 1500 + '\n\n')
+        self.assertEqual(''.join(p['text'] for p in parts), source)
+
+    def test_all_normal_reply_parts_reply_to_original_message(self):
+        telegram = Telegram(Config('test'))
+        telegram.call = Mock()
+        telegram.send(10, 'x' * 4001, reply_to=42)
+        self.assertEqual(telegram.call.call_count, 3)
+        for call in telegram.call.call_args_list:
+            self.assertEqual(call.args[1]['reply_parameters'],
+                             {'message_id': 42, 'allow_sending_without_reply': True})

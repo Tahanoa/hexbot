@@ -1,6 +1,14 @@
 """Render common model Markdown as Telegram text and UTF-16 entities."""
 import re
 
+PRESENTATION_PROMPT = (
+    "پاسخ را مرتب بنویس: هر موضوع در یک پاراگراف کوتاه و بین پاراگراف‌ها یک خط خالی. "
+    "برای چند مورد مستقل از فهرست کوتاه و برای مراحل از شماره‌گذاری استفاده کن. "
+    "عنوان کوتاه و بولد فقط وقتی چند بخش لازم است؛ پاسخ ساده را بی‌دلیل بخش‌بندی نکن. "
+    "کد واقعی را در بلوک کد بگذار، اما متن معمولی را داخل بک‌تیک یا کوتیشن نگذار. "
+    "از ایموجی معمولی به‌اندازه کم و متناسب با موضوع استفاده کن؛ شناسه یا تگ ایموجی پریمیوم نساز."
+)
+
 
 MARKUP = re.compile(
     r"```(?:(?P<language>[\w.+-]*)\n)?(?P<pre>.*?)(?:```|\Z)"
@@ -30,8 +38,17 @@ def reply_parts(source, formatted=False):
             text += value
             cursor = match.end()
     text += source[cursor:]
-    for start in range(0, len(text), 2000):
-        end = start + 2000
+    start = 0
+    while start < len(text):
+        end = min(start + 2000, len(text))
+        if end < len(text):
+            boundary = text.rfind('\n\n', start + 1000, end)
+            if boundary >= 0:
+                end = boundary + 2
+            else:
+                boundary = text.rfind('\n', start + 1000, end)
+                if boundary >= 0:
+                    end = boundary + 1
         part = text[start:end]
         entities = []
         for left, right, entity in spans:
@@ -44,3 +61,4 @@ def reply_parts(source, formatted=False):
         if entities:
             payload['entities'] = entities
         yield payload
+        start = end

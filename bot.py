@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
-from formatting import reply_parts
+from formatting import PRESENTATION_PROMPT, reply_parts
 
 LOG = logging.getLogger("hexbot")
 
@@ -142,12 +142,15 @@ class Telegram:
             raise ApiError("Telegram", data.get("error_code", 0), data.get("parameters", {}).get("retry_after", 0))
         return data["result"]
 
-    def send(self, chat_id: int, text: str, formatted: bool = False):
+    def send(self, chat_id: int, text: str, formatted: bool = False, reply_to: int | None = None):
         # 2,000 code points also fit within 4,096 UTF-16 units for emoji-only replies.
         for index, part in enumerate(reply_parts(text, formatted), 1):
             started = time.perf_counter()
             LOG.info("Telegram sending; chat ID: %s; part: %s", chat_id, index)
-            self.call("sendMessage", {"chat_id": chat_id, **part})
+            payload = {"chat_id": chat_id, **part}
+            if isinstance(reply_to, int) and reply_to > 0:
+                payload['reply_parameters'] = {'message_id': reply_to, 'allow_sending_without_reply': True}
+            self.call("sendMessage", payload)
             LOG.info("Telegram accepted reply; chat ID: %s; send: %.2fs", chat_id, time.perf_counter() - started)
 
 
@@ -157,8 +160,11 @@ class Ollama:
         self.client = JsonClient(config.ollama_url, "Ollama", proxy="")
 
     def chat(self, messages: list[dict], system_prompt: str | None = None) -> str:
+        prompt = self.config.system_prompt if system_prompt is None else system_prompt
+        if PRESENTATION_PROMPT not in prompt:
+            prompt += '\n\n' + PRESENTATION_PROMPT
         data = self.client.post("/api/chat", {"model": self.config.model,
-            "messages": [{"role": "system", "content": self.config.system_prompt if system_prompt is None else system_prompt}] + messages,
+            "messages": [{"role": "system", "content": prompt}] + messages,
             "stream": False, "options": {"num_predict": 2048,
                 "num_ctx": self.config.context_length}}, self.config.timeout)
         answer = data.get("message", {}).get("content", "")
@@ -224,7 +230,7 @@ class Bot:
             LOG.warning("%s", exc)
             self.telegram.send(chat_id, "پاسخ از Ollama دریافت نشد. اجرا بودن Ollama، نصب مدل و تنظیمات اتصال را بررسی کن و دوباره پیام بده.")
             return
-        self.telegram.send(chat_id, answer, formatted=True)
+        self.telegram.send(chat_id, answer, formatted=True, reply_to=message.get('message_id'))
         messages.append({"role": "assistant", "content": answer})
         with self.lock:
             self.history[chat_id] = messages[-self.config.history_turns * 2:]

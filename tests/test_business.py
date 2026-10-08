@@ -55,6 +55,63 @@ class BusinessTests(unittest.TestCase):
         self.assertEqual(reply['text'], 'مدل gemma3:12b')
         self.assertEqual(reply['entities'], [{'type': 'code', 'offset': 4, 'length': 10}])
 
+    def test_replies_reference_each_original_message_and_keep_sections(self):
+        self.ai.chat.return_value = '**اول**\n\n- مورد اول\n\n**دوم**\n\nتوضیح'
+        for ident in (101, 102):
+            msg = self.msg()
+            msg['message_id'] = ident
+            self.dispatch(msg)
+        self.assertEqual([s['reply_parameters'] for s in self.sends()],
+                         [{'message_id': 101}, {'message_id': 102}])
+        self.assertIn('\n\n', self.sends()[0]['text'])
+        self.assertIn('بین پاراگراف‌ها یک خط خالی', self.ai.chat.call_args.kwargs['system_prompt'])
+
+    def test_premium_reply_fallback_keeps_reply_and_formatting(self):
+        self.bot.state.set_reply_emoji('12345', '✨')
+        self.ai.chat.return_value = '**سلام**'
+        original_call = self.tg.call.side_effect
+        def call(method, data, **kwargs):
+            if method == 'sendMessage' and any(e['type'] == 'custom_emoji' for e in data.get('entities', [])):
+                raise ApiError('Telegram', 400)
+            return original_call(method, data, **kwargs)
+        self.tg.call.side_effect = call
+        msg = self.msg()
+        msg['message_id'] = 100
+        self.dispatch(msg)
+        attempted, fallback = self.sends()
+        self.assertEqual(attempted['entities'][0]['custom_emoji_id'], '12345')
+        self.assertEqual(fallback['text'], '✨ سلام')
+        self.assertEqual(fallback['entities'], [{'type': 'bold', 'offset': 2, 'length': 4}])
+        self.assertEqual(fallback['reply_parameters'], {'message_id': 100})
+        self.assertTrue(self.bot.state.has_replied(('A', 20)))
+
+    def test_reply_emoji_lookup_requires_animation_and_persists(self):
+        self.tg.call.return_value = [{'custom_emoji_id': '123', 'emoji': '✨', 'is_animated': True}]
+        self.tg.call.side_effect = None
+        self.bot.owner_command({'chat': {'id': 10}, 'text': '/emoji 123'})
+        self.bot.state.db.close()
+        self.bot.state = State(self.config.database_path)
+        self.assertEqual(self.bot.state.reply_emoji(), ('123', '✨'))
+        self.tg.call.return_value = [{'custom_emoji_id': '456', 'emoji': '⭐', 'is_animated': False}]
+        self.bot.owner_command({'chat': {'id': 10}, 'text': '/emoji 456'})
+        self.assertEqual(self.bot.state.reply_emoji(), ('123', '✨'))
+        self.bot.owner_command({'chat': {'id': 10}, 'text': '/emoji off'})
+        self.assertEqual(self.bot.state.reply_emoji(), ('', ''))
+
+    def test_emoji_pack_filters_animated_matching_candidates(self):
+        self.tg.call.side_effect = None
+        self.tg.call.return_value = {'stickers': [
+            {'custom_emoji_id': '123', 'emoji': '✨', 'is_animated': True},
+            {'custom_emoji_id': '456', 'emoji': '✨', 'is_animated': False},
+            {'custom_emoji_id': '789', 'emoji': '⭐', 'is_video': True}]}
+        self.bot.owner_command({'chat': {'id': 10},
+            'text': '/emoji https://t.me/addemoji/YellowEmojis_by_TgEmodziBot ✨'})
+        self.tg.call.assert_called_once_with('getStickerSet', {'name': 'YellowEmojis_by_TgEmodziBot'})
+        reply = self.tg.send.call_args.args[1]
+        self.assertIn('/emoji 123', reply)
+        self.assertNotIn('/emoji 456', reply)
+        self.assertNotIn('/emoji 789', reply)
+
     def test_introduction_state_survives_history_clear_and_restart(self):
         prompts = []
         def generate(*args, **kwargs):
