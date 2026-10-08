@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
-from formatting import PRESENTATION_PROMPT, reply_parts
+from formatting import PRESENTATION_PROMPT, reply_parts, with_assistant_footer
 
 LOG = logging.getLogger("hexbot")
 
@@ -142,12 +142,14 @@ class Telegram:
             raise ApiError("Telegram", data.get("error_code", 0), data.get("parameters", {}).get("retry_after", 0))
         return data["result"]
 
-    def send(self, chat_id: int, text: str, formatted: bool = False, reply_to: int | None = None):
+    def send(self, chat_id: int, text: str, formatted: bool = False, reply_to: int | None = None,
+             footer_url: str | None = None):
         # 2,000 code points also fit within 4,096 UTF-16 units for emoji-only replies.
         for index, part in enumerate(reply_parts(text, formatted), 1):
             started = time.perf_counter()
             LOG.info("Telegram sending; chat ID: %s; part: %s", chat_id, index)
             payload = {"chat_id": chat_id, **part}
+            payload = with_assistant_footer(payload, footer_url)
             if isinstance(reply_to, int) and reply_to > 0:
                 payload['reply_parameters'] = {'message_id': reply_to, 'allow_sending_without_reply': True}
             self.call("sendMessage", payload)
@@ -189,6 +191,11 @@ class Bot:
         self.lock = threading.Lock()
         self.busy: set[int] = set()
         self.stop = threading.Event()
+        self.username = ''
+
+    @property
+    def reply_url(self):
+        return 'https://t.me/' + self.username if self.username else None
 
     def respond(self, message: dict):
         chat_id = message["chat"]["id"]
@@ -230,7 +237,8 @@ class Bot:
             LOG.warning("%s", exc)
             self.telegram.send(chat_id, "پاسخ از Ollama دریافت نشد. اجرا بودن Ollama، نصب مدل و تنظیمات اتصال را بررسی کن و دوباره پیام بده.")
             return
-        self.telegram.send(chat_id, answer, formatted=True, reply_to=message.get('message_id'))
+        self.telegram.send(chat_id, answer, formatted=True, reply_to=message.get('message_id'),
+                           footer_url=self.reply_url)
         messages.append({"role": "assistant", "content": answer})
         with self.lock:
             self.history[chat_id] = messages[-self.config.history_turns * 2:]
@@ -273,6 +281,7 @@ class Bot:
 
     def run(self):
         me = self.telegram.call("getMe", {})
+        self.username = me.get('username', '')
         info = self.telegram.call("getWebhookInfo", {})
         if info.get("url"):
             raise ValueError("An active Telegram webhook exists. Remove it before using polling.")

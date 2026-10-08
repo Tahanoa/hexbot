@@ -62,3 +62,15 @@ def reply_parts(source, formatted=False):
             payload['entities'] = entities
         yield payload
         start = end
+
+
+def with_assistant_footer(payload, url):
+    """Add a trusted bot link outside model-generated formatting/code entities."""
+    if not url:
+        return payload
+    lead, label = '\n\nتوسط ', 'دستیار شخصی'
+    offset = len((payload['text'] + lead).encode('utf-16-le')) // 2
+    return dict(payload, text=payload['text'] + lead + label,
+                entities=list(payload.get('entities', [])) + [{'type': 'text_link',
+                    'offset': offset, 'length': len(label.encode('utf-16-le')) // 2, 'url': url}],
+                link_preview_options={'is_disabled': True})
