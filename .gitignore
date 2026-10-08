@@ -4,3 +4,7 @@ __pycache__/
 *.py[cod]
 secretary.json
 data/
+*.session
+*.session-journal
+*.session-wal
+*.session-shm

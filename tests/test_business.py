@@ -20,7 +20,7 @@ class BusinessTests(unittest.TestCase):
         root = Path(self.temp.name)
         profile = root / 'profile.json'
         profile.write_text(json.dumps({'owner_name': 'صاحب حساب', 'facts': ['زمان پاسخ مشخص نیست']}))
-        self.config = SecretaryConfig(10, profile, root / 'state.sqlite3')
+        self.config = SecretaryConfig(10, profile, root / 'state.sqlite3', debounce_seconds=0)
         self.tg, self.ai = Mock(), Mock()
         self.conn = {'id': 'A', 'user': {'id': 10}, 'is_enabled': True, 'rights': {'can_reply': True}}
         self.tg.call.side_effect = lambda method, data, **kw: dict(self.conn) if method == 'getBusinessConnection' else True
@@ -433,10 +433,10 @@ class BusinessTests(unittest.TestCase):
                 'from': {'id': user}, 'text': '/secretary off'}}, self.pool)
             self.assertEqual(self.bot.state.enabled(), user != 10)
 
-    def test_history_separate_for_connections(self):
+    def test_history_persists_across_connection_changes(self):
         self.dispatch(self.msg(connection='A'))
         self.dispatch(self.msg(connection='B'))
-        self.assertEqual(len(self.ai.chat.call_args.args[0]), 2)
+        self.assertEqual(len(self.ai.chat.call_args.args[0]), 4)
         self.assertIn(('A', 20), self.bot.history)
         self.assertIn(('B', 20), self.bot.history)
 
